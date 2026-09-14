@@ -3,7 +3,7 @@
 //! transfer / unshield) over the same module bus as keystore / eth-rpc / uniswap.
 //!
 //! Authoring split (mirrors `uniswap_module`): the pure, cargo-testable cores
-//! (`rpc_backend`, `keys`, `db_adapter`, `engine`) carry no Logos dependency and
+//! (`rpc_backend`, `keys`, `db_adapter`, `engine`, `relay`) carry no Logos dependency and
 //! are tested with `cargo test --no-default-features`. The `glue` module (behind
 //! the default `logos_module` feature) wires the contract trait to the Logos
 //! runtime via `logos-rust-sdk`.
@@ -14,6 +14,7 @@
 pub mod db_adapter;
 pub mod engine;
 pub mod keys;
+pub mod relay;
 pub mod rpc_backend;
 
 #[cfg(feature = "logos_module")]

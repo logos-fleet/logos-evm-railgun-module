@@ -18,21 +18,32 @@
 //! current-thread tokio runtime via `block_on`, on the module's dispatch thread
 //! (which carries the Qt event loop the engine's outbound `modules()` IPC needs).
 //!
+//! ## Signing is a request, not a call
+//! The relayer's EOA signature comes from `keystore_module`, which no longer
+//! signs on demand: a signature is approved by a human and collected later. So
+//! `relayed_send` does not return a `userOpHash` any more. It prepares the
+//! operation, asks for approval, parks the job and returns `{ ok, pending,
+//! requestId }`; `relayed_send_status` drives it forward and broadcasts once the
+//! human has decided. Nothing here parks a dispatch thread on a person — the
+//! keystore answers in microseconds and the decision arrives later. See
+//! [`crate::relay`] for the two passes that split the signing step.
+//!
 //! ⚠️ Unaudited upstream engine — Sepolia-first; the railgun keys never leave
 //! this module (see [`crate::keys`]).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use alloy::primitives::{Address, ChainId, Signature, B256};
-use alloy::signers::{Error as SignerError, Result as SignerResult, Signer};
-use async_trait::async_trait;
+use alloy::primitives::{Address, B256};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use userop_kit::signable_user_operation::SignableUserOperation;
 
 use crate::engine::RailgunEngine;
+use crate::relay;
 use crate::rpc_backend::RpcBackend;
 
 pub trait RailgunModule: 'static {
@@ -60,14 +71,28 @@ pub trait RailgunModule: 'static {
     /// UNSHIELD (private → public 0x): `{ "to": "0x…", "asset", "amount" }`
     /// → `{ ok, tx: TxData }` (Groth16-proven; engine adds the unshield fee).
     fn prepare_unshield(&mut self, params_json: String) -> String;
-    /// RELAYED private send (ERC-4337 — hides the sender): `{ "to": "0zk…"|"0x…",
-    /// "asset", "amount", "memo"?, "owner": "0x…", "bundlerUrl": "https://…" }`
-    /// → `{ ok, userOpHash }`. Routes 0zk→transfer / 0x→unshield, wraps it in a 7702
-    /// UserOp paid from the shielded pool, signs it with `owner`'s key **via
-    /// keystore** (`sign_digest`, key never leaves keystore), and submits the op to
-    /// `bundlerUrl` **through eth_rpc** (`raw_rpc_url`, proxied — the bundler never
-    /// sees the user's IP). Needs a live bundler + chain (no offline path).
+    /// REQUEST a relayed private send (ERC-4337 — hides the sender):
+    /// `{ "to": "0zk…"|"0x…", "asset", "amount", "memo"?, "owner": "0x…",
+    /// "bundlerUrl": "https://…" }` → `{ ok, pending: true, requestId }`.
+    /// Routes 0zk→transfer / 0x→unshield, wraps it in a 7702 UserOp paid from the
+    /// shielded pool, then asks `keystore_module` for a human to approve
+    /// `owner`'s signature over the operation's digests (the EOA key never
+    /// leaves keystore). Returns AS SOON AS the request is lodged — the
+    /// operation is not signed and nothing has been broadcast yet. Drive it with
+    /// [`Self::relayed_send_status`]. Needs a live bundler + chain (no offline
+    /// path).
     fn relayed_send(&mut self, params_json: String) -> String;
+    /// Drive a parked relayed send forward. `{ ok, state, userOpHash?, reason? }`
+    /// where `state` is `awaiting_approval` while the human has not decided,
+    /// `declined` once they refused (or the request expired or was cancelled),
+    /// and `done` once the approved operation has been submitted to the bundler
+    /// **through eth_rpc** (`raw_rpc_url`, proxied — the bundler never sees the
+    /// user's IP). Safe to call repeatedly; poll it.
+    fn relayed_send_status(&mut self, request_id: String) -> String;
+    /// Give up on a parked relayed send: withdraws the request so it stops
+    /// occupying the approver's queue. `{ ok }`. A request nobody withdraws is
+    /// swept by the keystore, but only after a minute.
+    fn relayed_send_cancel(&mut self, request_id: String) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -78,6 +103,25 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 struct RailgunModuleImpl {
     persist_dir: Option<PathBuf>,
     engine: Option<RailgunEngine>,
+    /// Relayed sends awaiting a human, keyed by the keystore approval handle
+    /// (the `requestId` the caller polls).
+    jobs: HashMap<String, PendingRelay>,
+}
+
+/// A prepared UserOperation parked on a human decision. Held whole rather than
+/// re-prepared on approval: re-preparing would iterate against the bundler
+/// again and could produce a DIFFERENT operation from the one that was
+/// approved.
+struct PendingRelay {
+    /// Authorises collecting the result. Returned by `request_approval` exactly
+    /// once, so it is never re-derivable — losing it loses the signatures.
+    receipt: String,
+    chain_id: i64,
+    bundler_url: String,
+    signable: SignableUserOperation,
+    /// Exactly the digests the human was asked to approve.
+    digests: Vec<B256>,
+    owner: Address,
 }
 
 // ── eth_rpc-backed RpcBackend (the chain-read seam the engine adapter uses) ──
@@ -103,56 +147,19 @@ impl RpcBackend for EthRpcBackend {
     }
 }
 
-// ── keystore-bridge signer (the EOA owner of the 7702 smart account) ─────────
-
-/// An alloy [`Signer`] that signs by calling `modules().keystore_module.sign_digest`
-/// over IPC, so the EOA private key never enters this module. Used by
-/// [`SignableUserOperation::sign`](userop_kit::signable_user_operation::SignableUserOperation)
-/// to sign the relayer's userOp hash (and its 7702 authorization hash) — both
-/// raw 32-byte digests the keystore signs without an EIP-191/712 prefix.
-struct KeystoreBridgeSigner {
-    owner: Address,
-    chain_id: u64,
-}
-
-#[async_trait]
-impl Signer for KeystoreBridgeSigner {
-    async fn sign_hash(&self, hash: &B256) -> SignerResult<Signature> {
-        let resp = modules()
-            .keystore_module
-            .sign_digest(&self.owner.to_string(), &format!("0x{hash:x}"))
-            .map_err(|e| SignerError::other(e.to_string()))?;
-        let v: Value = serde_json::from_str(&resp).map_err(|e| SignerError::other(e.to_string()))?;
-        if v.get("ok").and_then(Value::as_bool) != Some(true) {
-            let msg = v.get("error").and_then(Value::as_str).unwrap_or("sign_digest failed");
-            return Err(SignerError::other(msg.to_string()));
-        }
-        let sig_hex = v
-            .get("signature")
-            .and_then(Value::as_str)
-            .ok_or_else(|| SignerError::other("sign_digest: no signature"))?;
-        let bytes = hex::decode(sig_hex.trim_start_matches("0x"))
-            .map_err(|e| SignerError::other(e.to_string()))?;
-        Signature::try_from(bytes.as_slice()).map_err(|e| SignerError::other(e.to_string()))
-    }
-
-    fn address(&self) -> Address {
-        self.owner
-    }
-    fn chain_id(&self) -> Option<ChainId> {
-        Some(self.chain_id)
-    }
-    fn set_chain_id(&mut self, chain_id: Option<ChainId>) {
-        if let Some(c) = chain_id {
-            self.chain_id = c;
-        }
-    }
-}
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
+}
+
+/// Parse a dependency's `{ ok, ... }` JSON reply, surfacing `{ok:false}` as Err.
+fn ok_value(s: String) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+    if v.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(v.get("error").and_then(Value::as_str).unwrap_or("dependency error").to_string());
+    }
+    Ok(v)
 }
 
 /// Drive an async engine op on a per-call current-thread runtime (on this
@@ -370,64 +377,146 @@ impl RailgunModule for RailgunModuleImpl {
     }
 
     fn relayed_send(&mut self, params_json: String) -> String {
-        let p: RelayedSendParams = match serde_json::from_str(&params_json) {
-            Ok(p) => p,
-            Err(e) => return err(format!("bad relayed-send params: {e}")),
-        };
-        let amount = match parse_amount(&p.amount) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
-        let owner = match Address::from_str(&p.owner) {
-            Ok(a) => a,
-            Err(e) => return err(format!("bad owner address: {e}")),
-        };
-        let engine = match self.engine.as_mut() {
-            Some(e) => e,
-            None => return err("railgun_module not initialized (call init first)"),
-        };
+        match self.request_relayed_send(params_json) {
+            Ok(v) => v.to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn relayed_send_status(&mut self, request_id: String) -> String {
+        match self.drive_relayed_send(&request_id) {
+            Ok(v) => v.to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn relayed_send_cancel(&mut self, request_id: String) -> String {
+        match self.jobs.remove(&request_id) {
+            // Best effort: the job is dropped here either way, and an offer the
+            // keystore never hears about is swept on its own.
+            Some(job) => {
+                let _ = modules().keystore_module.cancel_approval(&request_id, &job.receipt);
+                json!({ "ok": true }).to_string()
+            }
+            None => err("unknown request"),
+        }
+    }
+}
+
+impl RailgunModuleImpl {
+    /// Prepare the relayed send and lodge the approval request. Returns as soon
+    /// as the keystore has the request — NOT when a human has answered it.
+    fn request_relayed_send(&mut self, params_json: String) -> Result<Value, String> {
+        let p: RelayedSendParams =
+            serde_json::from_str(&params_json).map_err(|e| format!("bad relayed-send params: {e}"))?;
+        let amount = parse_amount(&p.amount)?;
+        let owner = Address::from_str(&p.owner).map_err(|e| format!("bad owner address: {e}"))?;
+        let engine = self.engine.as_mut().ok_or("railgun_module not initialized (call init first)")?;
         let chain_id = engine.chain_id() as i64;
 
         // 1) Prepare the unsigned 7702 UserOperation (iterates against the bundler).
-        let signable = match block_on(engine.prepare_relayed_userop(
+        let signable = block_on(engine.prepare_relayed_userop(
             &p.to,
             &p.asset,
             amount,
             &p.memo,
             &p.owner,
             &p.bundler_url,
-        )) {
-            Ok(s) => s,
-            Err(e) => return err(e),
-        };
+        ))?;
 
-        // 2) Sign it (userOp hash + 7702 auth hash) with the owner's key via keystore.
-        let bridge = KeystoreBridgeSigner { owner, chain_id: chain_id as u64 };
-        let signed = match block_on(signable.sign(&bridge)) {
-            Ok(s) => s,
-            Err(e) => return err(format!("sign userop: {e}")),
-        };
+        // 2) Take the digests it needs signed, and put THOSE in front of a human.
+        //    `to` and `asset` can go in the purpose because the prepare above
+        //    already parsed both as addresses; the memo cannot, it is arbitrary
+        //    caller text and the keystore refuses text it cannot render safely.
+        let digests = block_on(relay::capture_digests(&signable, owner, chain_id as u64))?;
+        let purpose = format!(
+            "RAILGUN relayed private send: {amount} of {} to {}",
+            p.asset.trim(),
+            p.to.trim()
+        );
+        let intent = relay::relay_intent(&p.owner, &purpose, &digests)?;
 
-        // 3) Submit to the bundler through eth_rpc (proxied) — params are the
-        //    `eth_sendUserOperation` tuple `[userOp, entryPoint]`.
-        let params = match serde_json::to_string(&(&signed.user_op, &signed.entry_point)) {
-            Ok(s) => s,
-            Err(e) => return err(format!("encode userop: {e}")),
-        };
-        let resp = match modules().eth_rpc_module.raw_rpc_url(
-            chain_id,
-            &p.bundler_url,
-            "eth_sendUserOperation",
-            &params,
-        ) {
-            Ok(r) => r,
-            Err(e) => return err(format!("bundler submit: {e}")),
-        };
-        let v: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
-        if v.get("ok").and_then(Value::as_bool) != Some(true) {
-            return err(v.get("error").and_then(Value::as_str).unwrap_or("bundler submit failed"));
+        // 3) Ask. The keystore answers immediately with the handle to poll.
+        let resp = ok_value(
+            modules().keystore_module.request_approval(&intent).map_err(|e| e.to_string())?,
+        )?;
+        let handle = resp["handle"].as_str().ok_or("keystore: no handle")?.to_string();
+        let receipt = resp["receipt"].as_str().ok_or("keystore: no receipt")?.to_string();
+
+        self.jobs.insert(
+            handle.clone(),
+            PendingRelay {
+                receipt,
+                chain_id,
+                bundler_url: p.bundler_url,
+                signable,
+                digests,
+                owner,
+            },
+        );
+        Ok(json!({ "ok": true, "pending": true, "requestId": handle }))
+    }
+
+    /// Drive a parked relayed send: poll the decision, and on approval put the
+    /// signatures back into the operation and submit it. Safe to call
+    /// repeatedly — `fetch_result` is idempotent until it is acknowledged.
+    fn drive_relayed_send(&mut self, request_id: &str) -> Result<Value, String> {
+        let receipt = self.jobs.get(request_id).ok_or("unknown request")?.receipt.clone();
+
+        let st = ok_value(
+            modules()
+                .keystore_module
+                .approval_status(request_id, &receipt)
+                .map_err(|e| e.to_string())?,
+        )?;
+        match st["state"].as_str().unwrap_or("") {
+            "offered" | "rendered" => return Ok(json!({ "ok": true, "state": "awaiting_approval" })),
+            "settled" => {}
+            other => return Err(format!("unexpected approval state {other:?}")),
         }
-        json!({ "ok": true, "userOpHash": v.get("result").cloned().unwrap_or(Value::Null) }).to_string()
+        if st["reason"].as_str() != Some("approved") {
+            let reason = st["reason"].as_str().unwrap_or("settled").to_string();
+            self.jobs.remove(request_id);
+            return Ok(json!({ "ok": true, "state": "declined", "reason": reason }));
+        }
+
+        // Approved. Collect the signatures — `signed`, which is what
+        // `fetch_result` answers.
+        let fetched = ok_value(
+            modules().keystore_module.fetch_result(request_id, &receipt).map_err(|e| e.to_string())?,
+        )?;
+        let sigs: Vec<String> = fetched["signed"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        let job = self.jobs.remove(request_id).ok_or("unknown request")?;
+        let signed = block_on(relay::apply_signatures(
+            &job.signable,
+            job.owner,
+            job.chain_id as u64,
+            &job.digests,
+            &sigs,
+        ))?;
+
+        // Submit to the bundler through eth_rpc (proxied) — params are the
+        // `eth_sendUserOperation` tuple `[userOp, entryPoint]`.
+        let params = serde_json::to_string(&(&signed.user_op, &signed.entry_point))
+            .map_err(|e| format!("encode userop: {e}"))?;
+        let resp = ok_value(
+            modules()
+                .eth_rpc_module
+                .raw_rpc_url(job.chain_id, &job.bundler_url, "eth_sendUserOperation", &params)
+                .map_err(|e| format!("bundler submit: {e}"))?,
+        )?;
+
+        // The signatures are spent; let the keystore wipe its copy.
+        let _ = modules().keystore_module.ack_result(request_id, &receipt);
+        Ok(json!({
+            "ok": true,
+            "state": "done",
+            "userOpHash": resp.get("result").cloned().unwrap_or(Value::Null),
+        }))
     }
 }
 
