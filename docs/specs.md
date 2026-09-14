@@ -19,7 +19,7 @@ shielded-pool privacy system:
   **ERC-4337 bundler** so the *sender* is hidden too (no EOA in the public tx).
 
 The module is a Rust **cdylib** Logos module (same pattern as
-`keystore`/`eth-rpc`/`uniswap`). It exposes 9 `Q_INVOKABLE`-equivalent methods; all
+`keystore`/`eth-rpc`/`uniswap`). It exposes 11 `Q_INVOKABLE`-equivalent methods; all
 structured values cross the IPC boundary as JSON strings (`{ "ok": true, … }` /
 `{ "ok": false, "error": "…" }`).
 
@@ -34,7 +34,7 @@ railgun_module  (THIS — Rust cdylib, concurrency:single)
    ├─ adapter A: Eip1193Provider  ── chain reads ─→ modules().eth_rpc_module.raw_rpc
    ├─ adapter B: Database (DiskDatabase) ── note/merkle state under the instance dir
    ├─ key store: spending/viewing keys derived in-module, NEVER returned over IPC
-   ├─ keystore-bridge Signer ── userOp/7702 signing ─→ modules().keystore_module.sign_digest
+   ├─ approval requester ── userOp/7702 digests ─→ modules().keystore_module.request_approval
    └─ 4337 submit ── eth_sendUserOperation ─→ modules().eth_rpc_module.raw_rpc_url (proxied)
 ```
 
@@ -66,7 +66,8 @@ railgun_module  (THIS — Rust cdylib, concurrency:single)
 |---|---|
 | `eth_rpc_module.raw_rpc(chainId, method, params)` | every engine chain read (via adapter A) |
 | `eth_rpc_module.raw_rpc_url(chainId, url, method, params)` | submit `eth_sendUserOperation` to the bundler **through net-proxy** |
-| `keystore_module.sign_digest(owner, digestHex)` | sign the relayer's userOp hash + its EIP-7702 authorization (EOA key stays in keystore) |
+| `keystore_module.request_approval(intent)` | ask a human to approve `owner`'s signature over the relayer's userOp hash + its EIP-7702 authorization, as two opaque-digest legs of one bundle |
+| `keystore_module.approval_status` / `fetch_result` / `ack_result` / `cancel_approval` | poll that decision, collect the signatures, then let the keystore wipe its copy |
 
 The 4337 **submit** is routed through `eth_rpc` (not a module-owned HTTP client) so
 that a private send goes through the same fail-closed proxy as everything else — a
@@ -120,33 +121,62 @@ UNSHIELD (`private → 0x`). `params`: `{ "to": "0x…", "asset", "amount" }`. G
 proving; returns the proven `TxData`. The engine adds the chain's unshield fee so
 the recipient receives the exact amount.
 
-### `relayed_send(params_json) → { ok, userOpHash }`
-RELAYED private send — the **ERC-4337 broadcaster** path that **hides the sender**.
-`params`: `{ "to": "0zk…"|"0x…", "asset", "amount", "memo"?, "owner": "0x…",
-"bundlerUrl": "https://…" }`. Routes `0zk` → transfer, `0x` → unshield, wraps the
-RAILGUN tx in a **7702 UserOperation** paid for out of the shielded pool (the
-in-module railgun signer authorizes a fee note to the privacy paymaster), **signs**
-the userOp (and its 7702 authorization) via `keystore.sign_digest` (EOA key stays
-in keystore), and **submits** to `bundlerUrl` via `eth_rpc.raw_rpc_url` (proxied).
-Needs a live bundler + chain (the fee estimate iterates against both) — there is no
-offline path. The fee token is fixed to the chain's wrapped base token.
+### `relayed_send(params_json) → { ok, pending: true, requestId }`
+REQUEST a relayed private send — the **ERC-4337 broadcaster** path that **hides the
+sender**. `params`: `{ "to": "0zk…"|"0x…", "asset", "amount", "memo"?,
+"owner": "0x…", "bundlerUrl": "https://…" }`. Routes `0zk` → transfer, `0x` →
+unshield, wraps the RAILGUN tx in a **7702 UserOperation** paid for out of the
+shielded pool (the in-module railgun signer authorizes a fee note to the privacy
+paymaster), then asks `keystore.request_approval` for a **human** to approve
+`owner`'s signature over the operation's digests.
+
+It returns the moment the request is lodged. **Nothing is signed and nothing is
+broadcast yet** — drive it with `relayed_send_status`. Needs a live bundler + chain
+(the fee estimate iterates against both) — there is no offline path. The fee token
+is fixed to the chain's wrapped base token.
+
+### `relayed_send_status(request_id) → { ok, state, userOpHash?, reason? }`
+Poll a parked relayed send. `state` is:
+
+| `state` | meaning |
+|---|---|
+| `awaiting_approval` | the request is queued or on screen; the human has not decided |
+| `declined` | refused, cancelled, or expired — `reason` is the keystore's outcome |
+| `done` | the approved operation was submitted; `userOpHash` is the bundler's answer |
+
+Safe to call repeatedly: `fetch_result` is idempotent until it is acknowledged, so
+a dropped reply does not cost the human a second password entry. On `done` the
+signatures are acknowledged and the keystore wipes its copy.
+
+### `relayed_send_cancel(request_id) → { ok }`
+Give up on a parked relayed send, so it stops occupying the approver's queue. A
+request nobody withdraws is swept by the keystore, but only after a minute.
 
 ## Security model & invariants
 
 1. **Railgun keys never leave the module.** The spending key is a proving witness;
    spending/viewing keys live in-process and are never returned over IPC. Only
    public artifacts (the `0zk` address, balances, proofs, unsigned txs) cross.
-2. **The EOA key never leaves keystore.** The relayer signs via a keystore-bridge
-   `Signer` whose `sign_hash` calls `keystore.sign_digest` over IPC. The userOp's
-   EIP-712 signing hash is private to the engine, so signing happens *in-module*
-   with the bridge — the key is never relayed.
-3. **All network goes through `eth_rpc` → net-proxy.** Chain reads (adapter A) and
+2. **The EOA key never leaves keystore, and a human authorises every use of it.**
+   The userOp's EIP-712 signing hash is private to userop-kit — only
+   `SignableUserOperation::sign` can produce it — so the signing step is split into
+   two passes over the same operation (`src/relay.rs`): a capture pass records the
+   digests `sign` asks for, and those digests are what the human is shown; a replay
+   pass puts the approved signatures back and **refuses any digest that is not the
+   one that was captured**. Either the bytes a human approved are the bytes in the
+   submitted operation, or nothing is submitted.
+3. **No dispatch thread waits on a person.** `relayed_send` returns as soon as the
+   keystore has the request; the decision is collected by polling
+   `relayed_send_status`. A digest leg is opaque by construction, so this module
+   only asks for digests it can name — an unrecognised one is refused here rather
+   than put in front of a human as a mystery to wave through.
+4. **All network goes through `eth_rpc` → net-proxy.** Chain reads (adapter A) and
    the bundler submit (`raw_rpc_url`) are fail-closed proxied. A private send must
    not degrade to leaking the user's IP. (Circuit-artifact downloads during proving
    are a known exception — see below.)
-4. **Sepolia-first, mainnet-gated, unaudited.** The engine is unaudited; the UI and
+5. **Sepolia-first, mainnet-gated, unaudited.** The engine is unaudited; the UI and
    this spec carry the warning; the default chain is Sepolia.
-5. **EOA-bound key derivation.** `init_from_seed` derives the railgun wallet from a
+6. **EOA-bound key derivation.** `init_from_seed` derives the railgun wallet from a
    deterministic EOA signature, so there is no separate seed to back up; recovery
    follows EOA control.
 
@@ -158,8 +188,12 @@ offline path. The fee token is fixed to the chain's wrapped base token.
   fork. Until then, proving (`prepare_transfer`/`prepare_unshield`/`relayed_send`)
   needs network reachability to that source.
 - **Canonical recovery**: `init_from_seed` is not yet RAILGUN-Community BIP-32.
-- **UserOp status**: `relayed_send` returns the `userOpHash`; polling its receipt
-  (`eth_getUserOperationReceipt`) is coordinator/UI follow-up work.
+- **UserOp status**: `relayed_send_status` returns the `userOpHash` once the
+  operation is submitted; polling its receipt (`eth_getUserOperationReceipt`) is
+  coordinator/UI follow-up work.
+- **No approval event subscription**: a caller polls `relayed_send_status`. The
+  keystore announces decisions on its event plane (`approval_settled`), which this
+  module could subscribe to instead of being polled — follow-up.
 
 ## Build, run & test
 
