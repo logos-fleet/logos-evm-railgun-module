@@ -116,7 +116,7 @@ struct PendingRelay {
     /// Authorises collecting the result. Returned by `request_approval` exactly
     /// once, so it is never re-derivable — losing it loses the signatures.
     receipt: String,
-    chain_id: i64,
+    chain_id: u64,
     bundler_url: String,
     signable: SignableUserOperation,
     /// Exactly the digests the human was asked to approve.
@@ -153,10 +153,12 @@ fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
 }
 
-/// Parse a dependency's `{ ok, ... }` JSON reply, surfacing `{ok:false}` as Err.
+/// Parse a dependency's `{ ok, ... }` JSON reply. Anything but an explicit
+/// `ok: true` is an Err: a reply this module cannot read is a failure, not a
+/// success with missing fields.
 fn ok_value(s: String) -> Result<Value, String> {
     let v: Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
-    if v.get("ok").and_then(Value::as_bool) == Some(false) {
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(v.get("error").and_then(Value::as_str).unwrap_or("dependency error").to_string());
     }
     Ok(v)
@@ -392,9 +394,9 @@ impl RailgunModule for RailgunModuleImpl {
 
     fn relayed_send_cancel(&mut self, request_id: String) -> String {
         match self.jobs.remove(&request_id) {
-            // Best effort: the job is dropped here either way, and an offer the
-            // keystore never hears about is swept on its own.
             Some(job) => {
+                // Best effort: the job is dropped here either way, and an offer
+                // the keystore never hears about is swept on its own.
                 let _ = modules().keystore_module.cancel_approval(&request_id, &job.receipt);
                 json!({ "ok": true }).to_string()
             }
@@ -412,7 +414,7 @@ impl RailgunModuleImpl {
         let amount = parse_amount(&p.amount)?;
         let owner = Address::from_str(&p.owner).map_err(|e| format!("bad owner address: {e}"))?;
         let engine = self.engine.as_mut().ok_or("railgun_module not initialized (call init first)")?;
-        let chain_id = engine.chain_id() as i64;
+        let chain_id = engine.chain_id();
 
         // 1) Prepare the unsigned 7702 UserOperation (iterates against the bundler).
         let signable = block_on(engine.prepare_relayed_userop(
@@ -428,7 +430,7 @@ impl RailgunModuleImpl {
         //    `to` and `asset` can go in the purpose because the prepare above
         //    already parsed both as addresses; the memo cannot, it is arbitrary
         //    caller text and the keystore refuses text it cannot render safely.
-        let digests = block_on(relay::capture_digests(&signable, owner, chain_id as u64))?;
+        let digests = block_on(relay::capture_digests(&signable, owner, chain_id))?;
         let purpose = format!(
             "RAILGUN relayed private send: {amount} of {} to {}",
             p.asset.trim(),
@@ -480,8 +482,8 @@ impl RailgunModuleImpl {
             return Ok(json!({ "ok": true, "state": "declined", "reason": reason }));
         }
 
-        // Approved. Collect the signatures — `signed`, which is what
-        // `fetch_result` answers.
+        // Approved. Collect the signatures: `fetch_result` answers with them
+        // under `signed`.
         let fetched = ok_value(
             modules().keystore_module.fetch_result(request_id, &receipt).map_err(|e| e.to_string())?,
         )?;
@@ -494,7 +496,7 @@ impl RailgunModuleImpl {
         let signed = block_on(relay::apply_signatures(
             &job.signable,
             job.owner,
-            job.chain_id as u64,
+            job.chain_id,
             &job.digests,
             &sigs,
         ))?;
@@ -506,7 +508,7 @@ impl RailgunModuleImpl {
         let resp = ok_value(
             modules()
                 .eth_rpc_module
-                .raw_rpc_url(job.chain_id, &job.bundler_url, "eth_sendUserOperation", &params)
+                .raw_rpc_url(job.chain_id as i64, &job.bundler_url, "eth_sendUserOperation", &params)
                 .map_err(|e| format!("bundler submit: {e}"))?,
         )?;
 

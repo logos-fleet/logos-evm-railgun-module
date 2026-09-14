@@ -76,8 +76,9 @@ impl Signer for CaptureSigner {
 struct ReplaySigner {
     owner: Address,
     chain_id: u64,
-    expected: Vec<B256>,
-    sigs: Vec<Signature>,
+    /// Each approved digest with the signature approved FOR it, so the two can
+    /// never be indexed apart.
+    approved: Vec<(B256, Signature)>,
     next: Mutex<usize>,
 }
 
@@ -86,10 +87,10 @@ impl Signer for ReplaySigner {
     async fn sign_hash(&self, hash: &B256) -> SignerResult<Signature> {
         let mut next = self.next.lock().map_err(|_| SignerError::other("replay lock poisoned"))?;
         let i = *next;
-        let expected = self.expected.get(i).ok_or_else(|| {
+        let (expected, sig) = self.approved.get(i).ok_or_else(|| {
             SignerError::other(format!(
                 "the human approved {} digest(s); this operation wants more",
-                self.expected.len()
+                self.approved.len()
             ))
         })?;
         if expected != hash {
@@ -98,9 +99,8 @@ impl Signer for ReplaySigner {
                 i + 1
             )));
         }
-        let sig = self.sigs[i];
         *next = i + 1;
-        Ok(sig)
+        Ok(*sig)
     }
 
     fn address(&self) -> Address {
@@ -181,14 +181,12 @@ pub async fn apply_signatures(
             digests.len()
         ));
     }
-    let sigs = signatures.iter().map(|s| parse_signature(s)).collect::<Result<Vec<_>, _>>()?;
-    let replay = ReplaySigner {
-        owner,
-        chain_id,
-        expected: digests.to_vec(),
-        sigs,
-        next: Mutex::new(0),
-    };
+    let approved = digests
+        .iter()
+        .zip(signatures)
+        .map(|(d, s)| parse_signature(s).map(|sig| (*d, sig)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let replay = ReplaySigner { owner, chain_id, approved, next: Mutex::new(0) };
     let signed = op.sign(&replay).await.map_err(|e| format!("apply approved signatures: {e}"))?;
     let used = *replay.next.lock().map_err(|_| "replay lock poisoned".to_string())?;
     if used != digests.len() {
