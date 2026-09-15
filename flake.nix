@@ -73,13 +73,13 @@
       # is no `nix.external_libraries` here, so nothing is staged into lib/ as
       # a build-platform image that the builder could not rebuild.
       #
-      # ONE THING IS BUILT AND NOT PROVEN, and it belongs in the record rather
-      # than in a promise: `wasmer`'s cranelift backend is a JIT, and iOS
-      # refuses RWX pages to an app without the dynamic-codesigning
+      # ONE THING IS BUILT AND NOT PROVEN (#188), and it belongs in the record
+      # rather than in a promise: `wasmer`'s cranelift backend is a JIT, and
+      # iOS refuses RWX pages to an app without the dynamic-codesigning
       # entitlement. The artifact links and passes the Bare gate; whether
       # `ark-circom` can generate a witness on an iPhone is a RUNTIME question
       # no one has been able to ask yet, because this module cannot join a
-      # Bundled set (below) and so has never been on a device.
+      # Bundled set (above) and so has never been on a device.
       #
       # `? ${t}` rather than a bare index, so a logos-module-builder pin without
       # the mobile cross sets leaves this flake simply WITHOUT mobile keys
