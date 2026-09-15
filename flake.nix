@@ -87,7 +87,30 @@
       mobileTargets = builtins.filter (t: module.packages ? ${t})
         [ "aarch64-ios" "aarch64-ios-simulator" "aarch64-android" ];
 
-      # ── THE `web` (wasm) OUTPUT IS WITHHELD, AND THE BLOCK BELOW SAYS WHY ──
+      # ── THE `web` (wasm) OUTPUT IS WITHHELD (#168) ─────────────────────────
+      #
+      # `packages.<system>.web` is simply ABSENT rather than an attribute that
+      # fails to compile, and what blocks it is not this module's call sites.
+      # The RAILGUN engine and `userop-kit` (both from github.com/ethereum/
+      # kohaku) depend on `reqwest` with its DEFAULT features, so the ERC-4337
+      # bundler client opens its own socket rather than going out through
+      # `modules().eth_rpc_module`; reqwest picks its browser backend only for
+      # `target_os = "unknown"` / `"none"` (reqwest 0.13.4 lib.rs:267), and a
+      # Logos `web` image is built for `wasm32-unknown-emscripten` deliberately
+      # (logos-module-builder's `rustWasmTarget`). It therefore takes the
+      # hyper + tokio/net path, and `mio` has no emscripten `sys`. Cargo UNIONS
+      # features, so no line in this crate's Cargo.toml can subtract that
+      # transport and `[patch]` redirects a source rather than a feature set:
+      # the change belongs in kohaku.
+      #
+      # DELETE `withoutWeb` the day kohaku's HTTP goes through a transport a
+      # Worker has. That is the one condition.
+      #
+      # docs/specs.md holds the rest of the record: the measurement this came
+      # from (`cargo check --target wasm32-unknown-emscripten` fails on `mio`
+      # and `socket2` and NOTHING else — the `wasmer`/cranelift JIT everyone
+      # expects to be the problem is gated out of the wasm32 graph), and why
+      # #168's `_async` call-site port is not done here either.
       #
       # `removeAttrs` rather than a metadata flag, deliberately: ADR 0009's
       # first gate (`"platform": true`) is the right WORD for this module but it
@@ -97,7 +120,7 @@
       # by its own flake.lock would be a worse regression than the missing
       # output. Exporting one attribute fewer says the same thing to every
       # consumer (`pkgs.web or null`) and works against every pin.
-      withoutWeb = pkgs: builtins.removeAttrs pkgs [ "web" "railgun_module-web" ];
+      withoutWeb = targetPkgs: builtins.removeAttrs targetPkgs [ "web" "railgun_module-web" ];
     in
     {
       packages = nixpkgs.lib.genAttrs (systems ++ mobileTargets)
@@ -120,63 +143,5 @@
       # `configFor` is the per-target resolution of the same document; this
       # module has no `platforms` overlay, so the two agree everywhere.
       inherit (module) config configFor;
-
-      # ── WHY THERE IS NO `web` (wasm) OUTPUT (#168) ─────────────────────────
-      #
-      # `withoutWeb` above drops it, so `packages.<system>.web` is simply ABSENT
-      # rather than an attribute that fails to compile. This module owns access a
-      # Web container cannot give it, which is ADR 0009's first gate.
-      #
-      # #168 asked for the opposite — a `web` image and a `web-variant` check,
-      # the same port `uniswap_module` got in #167 and `wallet_backend_module`
-      # got beside this commit. It is not the port that is missing. What the
-      # attempt found, measured rather than reasoned about:
-      #
-      #   cargo check --target wasm32-unknown-emscripten --keep-going
-      #     error: could not compile `mio`     (27 errors: no `sys` backend)
-      #     error: could not compile `socket2` (2 errors)
-      #   ...and NOTHING ELSE. All 257 other crates in the tree cross, including
-      #   `ark-circom` and `wasmer` — whose sys backend (`wasmer-vm`,
-      #   `wasmer-compiler-cranelift`) and whose `quinn-udp`/`aws-lc-sys`
-      #   neighbours are all gated OUT of the wasm32 dep graph, which was the
-      #   failure everyone expected and is not the one that happens.
-      #
-      # THE BLOCKER IS A TARGET TRIPLE IN AN UPSTREAM CRATE. The RAILGUN engine
-      # and `userop-kit` (both from github.com/ethereum/kohaku) depend on
-      # `reqwest` with its default features, i.e. its native transport; the
-      # ERC-4337 bundler client opens that socket itself rather than going out
-      # through `modules().eth_rpc_module`. reqwest picks its browser backend
-      # only for `all(target_arch = "wasm32", any(target_os = "unknown",
-      # target_os = "none"))` (reqwest 0.13.4 lib.rs:267), and a Logos `web`
-      # image is built for `wasm32-unknown-emscripten` deliberately — it needs
-      # emscripten's libc, filesystem and JS glue (logos-module-builder's
-      # `rustWasmTarget`). So reqwest takes the hyper + tokio/net path, and mio
-      # has no emscripten `sys`.
-      #
-      # AND IT CANNOT BE FIXED FROM THIS REPO. Cargo UNIONS features: a
-      # dependent cannot subtract `default` from a feature another crate
-      # enabled, so no line in this module's Cargo.toml turns that transport
-      # off. `[patch]` redirects a source, not a feature set. The change belongs
-      # where the dependency is declared — in kohaku — and it is a real change
-      # rather than a flag, because the bundler client needs a transport that
-      # exists in a Worker.
-      #
-      # WHICH IS ALSO WHY WITHHOLDING IT IS HONEST and not just a way to make a
-      # broken output go away: a module whose engine opens its own sockets,
-      # outside this wallet's proxy policy, is exactly a module a Web container
-      # cannot host. Delete `withoutWeb` the day kohaku's HTTP goes through a
-      # transport a Worker has — that is the one condition, and it is stated
-      # here so the next reader does not have to re-derive it.
-      #
-      # THE REST OF #168's PORT IS DELIBERATELY NOT DONE HERE either, and this
-      # is the place to say so. Rewriting the call sites onto the `_async`
-      # clients buys a module with no `web` variant nothing, and it would cost:
-      # this module is `concurrency: "single"`, so its dispatch IS the Qt main
-      # thread and the completion of an async call is marshalled onto that same
-      # thread — the "dispatch, then wait" spelling `uniswap_module` could adopt
-      # would deadlock here. Worse, most of its outbound traffic is not at a
-      # call site at all: the engine drives every chain read through the
-      # synchronous `RpcBackend` seam (rust-lib/src/rpc_backend.rs) from inside
-      # its own async code, which no callback rewrite in this crate can reach.
     };
 }
