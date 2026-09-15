@@ -194,6 +194,42 @@ request nobody withdraws is swept by the keystore, but only after a minute.
 - **No approval event subscription**: a caller polls `relayed_send_status`. The
   keystore announces decisions on its event plane (`approval_settled`), which this
   module could subscribe to instead of being polled — follow-up.
+- **No `web` (wasm) variant, and not for a reason in this repo (#168).** The flake
+  withholds `packages.<system>.web`. What blocks it, measured rather than assumed:
+
+  ```
+  cargo check --target wasm32-unknown-emscripten --keep-going
+    error: could not compile `mio`     (27 errors -- no `sys` backend for this target)
+    error: could not compile `socket2` (2 errors)
+  ```
+
+  and nothing else: the other 257 crates cross, `ark-circom` included, and
+  `wasmer`'s sys backend (`wasmer-vm`, `wasmer-compiler-cranelift`) along with
+  `quinn-udp` and `aws-lc-sys` are all gated OUT of the wasm32 dependency graph —
+  the JIT everyone expects to be the problem is not the one that happens.
+
+  `mio` and `socket2` arrive under `reqwest`, which the upstream `railgun` and
+  `userop-kit` crates (github.com/ethereum/kohaku) depend on with its DEFAULT
+  features: the ERC-4337 bundler client opens that socket itself instead of going
+  out through `modules().eth_rpc_module`. reqwest selects its browser transport
+  only for `all(target_arch = "wasm32", any(target_os = "unknown", target_os =
+  "none"))`, and a Logos `web` image is built for `wasm32-unknown-emscripten`
+  deliberately (it needs emscripten's libc, filesystem and JS glue), so reqwest
+  takes the hyper + `tokio/net` path.
+
+  **It cannot be fixed from here.** Cargo unions features, so no line in this
+  crate's `Cargo.toml` can subtract `default` from a dependency another crate
+  enabled, and `[patch]` redirects a source rather than a feature set. The change
+  belongs in kohaku, and it is a real change rather than a flag: the bundler
+  client needs a transport a Worker has.
+
+  For the same reason the `_async` port #168 asked for is **not** done here. It
+  buys a module with no `web` variant nothing, and it would cost: this module is
+  `concurrency: "single"`, so its dispatch is the Qt main thread that an async
+  completion is marshalled onto, and "dispatch, then wait" deadlocks. Most of the
+  outbound traffic is not at a call site anyway — the engine drives every chain
+  read through the synchronous `RpcBackend` seam (`rust-lib/src/rpc_backend.rs`)
+  from inside its own async code, which no callback rewrite in this crate reaches.
 
 ## Build, run & test
 

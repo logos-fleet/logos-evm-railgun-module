@@ -86,10 +86,45 @@
       # instead of failing to evaluate.
       mobileTargets = builtins.filter (t: module.packages ? ${t})
         [ "aarch64-ios" "aarch64-ios-simulator" "aarch64-android" ];
+
+      # ── THE `web` (wasm) OUTPUT IS WITHHELD (#168) ─────────────────────────
+      #
+      # `packages.<system>.web` is simply ABSENT rather than an attribute that
+      # fails to compile, and what blocks it is not this module's call sites.
+      # The RAILGUN engine and `userop-kit` (both from github.com/ethereum/
+      # kohaku) depend on `reqwest` with its DEFAULT features, so the ERC-4337
+      # bundler client opens its own socket rather than going out through
+      # `modules().eth_rpc_module`; reqwest picks its browser backend only for
+      # `target_os = "unknown"` / `"none"` (reqwest 0.13.4 lib.rs:267), and a
+      # Logos `web` image is built for `wasm32-unknown-emscripten` deliberately
+      # (logos-module-builder's `rustWasmTarget`). It therefore takes the
+      # hyper + tokio/net path, and `mio` has no emscripten `sys`. Cargo UNIONS
+      # features, so no line in this crate's Cargo.toml can subtract that
+      # transport and `[patch]` redirects a source rather than a feature set:
+      # the change belongs in kohaku.
+      #
+      # DELETE `withoutWeb` the day kohaku's HTTP goes through a transport a
+      # Worker has. That is the one condition.
+      #
+      # docs/specs.md holds the rest of the record: the measurement this came
+      # from (`cargo check --target wasm32-unknown-emscripten` fails on `mio`
+      # and `socket2` and NOTHING else — the `wasmer`/cranelift JIT everyone
+      # expects to be the problem is gated out of the wasm32 graph), and why
+      # #168's `_async` call-site port is not done here either.
+      #
+      # `removeAttrs` rather than a metadata flag, deliberately: ADR 0009's
+      # first gate (`"platform": true`) is the right WORD for this module but it
+      # exists only in the builder this workspace pins, and a metadata key an
+      # older logos-module-builder does not know is not ignored there — it is a
+      # hard eval error naming `platforms`. A module that could not be evaluated
+      # by its own flake.lock would be a worse regression than the missing
+      # output. Exporting one attribute fewer says the same thing to every
+      # consumer (`pkgs.web or null`) and works against every pin.
+      withoutWeb = targetPkgs: builtins.removeAttrs targetPkgs [ "web" "railgun_module-web" ];
     in
     {
       packages = nixpkgs.lib.genAttrs (systems ++ mobileTargets)
-        (target: module.packages.${target});
+        (target: withoutWeb module.packages.${target});
 
       # An Android cross derivation's `system` is its BUILD platform, so
       # `packages.aarch64-android` is pinned to the builder's canonical one
