@@ -216,6 +216,37 @@ comparing two threads of this image and worthless for anything else.
 A leg that fails does not end the probe. Needs no chain, no keys and no engine;
 safe to call before `init`.
 
+**MEASURED, and it works.** Physical iPad Air (4th generation), iOS 26.5.2,
+2026-09-16, through the mobile Shell
+(`--call railgun_module.web_dependency_probe()` with
+`LOGOS_BUNDLE_APPS=capability_module,railgun_module`):
+
+```
+{"ok":true,"target":"keystore_module",
+ "callerKind":"module","callerIdentity":"railgun_module","callerIsThisModule":true,
+ "dispatchThread":"ThreadId(2)","loadThread":"ThreadId(1)","dispatchLeftTheLoadThread":true,
+ "legs":[{"method":"caller_identity","ms":25,"ok":true,…},
+         {"method":"list_accounts","ms":1,"ok":true,…},
+         {"method":"caller_identity","ms":1,"ok":true,…}]}
+```
+
+The keystore on that device is the `web` variant — `web-modules/keystore_module/
+index.html`, 1 118 126 bytes of wasm, `idbfs` at `/logos-data` — and this module
+is a Bare framework embedded in the app. The first crossing carries the
+capability handshake (`requestModule for origin: "railgun_module"`); the ones
+after it are free. In the same run the Shell's own
+`--call keystore_module.caller_identity()` answers `kind: "host"`, so the page is
+genuinely telling its callers apart rather than echoing a constant.
+
+Ordering needed no care: the core loads a closure topologically and the Web
+container waits for the page to serve, so `keystore_module` was loaded 31 ms
+before `railgun_module` was. See logos-workspace#196 and its ADR 0010.
+
+**Android is not where this can be asked** — `railgun_module` has no working
+`aarch64-android` Bare build: `wasmer`'s build script fails generating the
+`wasmi` bindings against the NDK sysroot (`fatal error: 'features.h' file not
+found`), which predates this probe and is tracked separately.
+
 The calls go through a raw `PluginProxy` rather than `modules().keystore_module`,
 and the two are the same call — a LIDL-generated wrapper for a `String`-returning
 method *is* `proxy.call_json(method, [])`. The proxy measures the transport rather
