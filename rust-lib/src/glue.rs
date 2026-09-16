@@ -110,18 +110,20 @@ pub trait RailgunModule: 'static {
     /// See [`crate::witness_engine`].
     fn witness_engine_probe(&mut self) -> String;
     /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
-    /// `{ ok, target, thread, callerKind, callerIdentity, callerIsThisModule,
+    /// `{ ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread,
+    /// callerKind, callerIdentity, callerIsThisModule,
     /// legs: [{ method, ms, ok, reply?, error? }] }`.
     ///
-    /// On a phone `keystore_module` is a `web` (wasm) variant -- a page in the
-    /// Shell's container -- and this module is native, Bare and in-process.
+    /// On a phone `keystore_module` is a `web` (wasm) variant — a page in the
+    /// Shell's container — and this module is native, Bare and in-process.
     /// ADR 0010 lets a Bundled member depend on the image's web half, which is
     /// what puts this module in the mobile catalog at all, and it rests on the
     /// host's claim that a consumer reaches a Web module exactly as it reaches
     /// a subprocess one. This asks that claim on the device: three ordinary
     /// crossings to the dependency, timed, with the name the page believes
-    /// called it. No chain, no keys, no engine -- safe to call before `init`.
-    /// See [`crate::web_dependency`].
+    /// called it, and the thread the dispatch ran on beside the one the image
+    /// was loaded on. No chain, no keys, no engine — safe to call before
+    /// `init`. See [`crate::web_dependency`].
     fn web_dependency_probe(&mut self) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
@@ -470,7 +472,7 @@ impl RailgunModule for RailgunModuleImpl {
             "callerIsThisModule": p.identity_is_this_module(),
             "legs": p.legs.iter().map(|l: &Leg| json!({
                 "method": l.method,
-                "ms": l.ms as u64,
+                "ms": l.ms,
                 "ok": l.ok(),
                 "reply": l.reply,
                 "error": l.error,
@@ -484,11 +486,10 @@ impl RailgunModule for RailgunModuleImpl {
 ///
 /// A raw `PluginProxy` rather than `modules().keystore_module`, and the two are
 /// the same call: a LIDL-generated wrapper for a `String`-returning method IS
-/// `proxy.call_json(method, [])` with the answer unwrapped. Going through the
-/// proxy keeps the probe asking its question against a `keystore_module` pin
-/// whose generated contract predates `caller_identity` -- which this crate's
-/// own flake.lock is -- and it measures the transport rather than this module's
-/// generated copy of someone else's contract. See [`crate::web_dependency`].
+/// `proxy.call_json(method, [])` with the answer unwrapped. It is the proxy so
+/// that the probe still asks its question against a `keystore_module` pin whose
+/// generated contract predates `caller_identity` — which this crate's own
+/// flake.lock is. [`crate::web_dependency`] has the rest of the reasoning.
 struct BusDependency(logos_rust_sdk::PluginProxy);
 
 impl BusDependency {

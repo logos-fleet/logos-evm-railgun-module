@@ -83,6 +83,36 @@ pub trait Dependency {
     fn list_accounts(&mut self) -> Result<String, String>;
 }
 
+/// One crossing [`probe`] makes, and the method on [`Dependency`] it is.
+///
+/// An enum rather than a method name, so that the list of legs and the calls
+/// they make cannot drift apart: adding one here is a compile error until it
+/// says what to call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Call {
+    /// Who the dependency thinks is calling it.
+    CallerIdentity,
+    /// An ordinary contract read, so a leg carries a real body.
+    ListAccounts,
+}
+
+impl Call {
+    /// The method name on the dependency's contract, and what a leg reports.
+    pub fn method(self) -> &'static str {
+        match self {
+            Call::CallerIdentity => "caller_identity",
+            Call::ListAccounts => "list_accounts",
+        }
+    }
+
+    fn make(self, dep: &mut impl Dependency) -> Result<String, String> {
+        match self {
+            Call::CallerIdentity => dep.caller_identity(),
+            Call::ListAccounts => dep.list_accounts(),
+        }
+    }
+}
+
 /// One outbound call, and what became of it.
 #[derive(Debug, Clone)]
 pub struct Leg {
@@ -91,7 +121,7 @@ pub struct Leg {
     /// Wall-clock milliseconds the call took, answered or not. The first leg
     /// carries the page's warm-up; a later one that is still slow is the page
     /// itself rather than the seam.
-    pub ms: u128,
+    pub ms: u64,
     /// What came back, verbatim.
     pub reply: Option<String>,
     /// Why nothing came back.
@@ -128,7 +158,7 @@ pub struct Probe {
 }
 
 /// What [`probe`] calls, in order.
-pub const LEGS: [&str; 3] = ["caller_identity", "list_accounts", "caller_identity"];
+pub const LEGS: [Call; 3] = [Call::CallerIdentity, Call::ListAccounts, Call::CallerIdentity];
 
 impl Probe {
     /// A native module can call a `web` module here, AND is correctly named as
@@ -162,7 +192,7 @@ impl Probe {
 /// names the leg the silence began in. Same reason `witness_engine` announces
 /// its stages, and the same shape.
 fn entering(method: &str) {
-    eprintln!("railgun_module: web-dependency probe [{TARGET}]: entering {method}");
+    eprintln!("{THIS_MODULE}: web-dependency probe [{TARGET}]: entering {method}");
 }
 
 /// `kind` and `identity` out of a `caller_identity` reply.
@@ -196,18 +226,16 @@ pub fn probe(dep: &mut impl Dependency, load_thread: Option<String>) -> Probe {
         saw_identity: None,
     };
 
-    for method in LEGS {
+    for call in LEGS {
+        let method = call.method();
         entering(method);
         let started = Instant::now();
-        let answer = match method {
-            "list_accounts" => dep.list_accounts(),
-            _ => dep.caller_identity(),
-        };
-        let ms = started.elapsed().as_millis();
+        let answer = call.make(dep);
+        let ms = started.elapsed().as_millis() as u64;
 
         let leg = match answer {
             Ok(reply) => {
-                if method == "caller_identity" {
+                if call == Call::CallerIdentity {
                     let (kind, identity) = identity_of(&reply);
                     out.saw_kind = kind;
                     out.saw_identity = identity;
@@ -217,7 +245,7 @@ pub fn probe(dep: &mut impl Dependency, load_thread: Option<String>) -> Probe {
             Err(e) => Leg { method, ms, reply: None, error: Some(e) },
         };
         eprintln!(
-            "railgun_module: web-dependency probe [{TARGET}]: {method} {} in {ms} ms ({})",
+            "{THIS_MODULE}: web-dependency probe [{TARGET}]: {method} {} in {ms} ms ({})",
             if leg.ok() { "ANSWERED" } else { "FAILED" },
             leg.error.as_deref().or(leg.reply.as_deref()).unwrap_or("")
         );
@@ -225,7 +253,7 @@ pub fn probe(dep: &mut impl Dependency, load_thread: Option<String>) -> Probe {
     }
 
     eprintln!(
-        "railgun_module: web-dependency probe [{TARGET}]: {} (dispatch-thread={} load-thread={:?} \
+        "{THIS_MODULE}: web-dependency probe [{TARGET}]: {} (dispatch-thread={} load-thread={:?} \
          left-the-load-thread={:?} caller-kind={:?} caller-identity={:?})",
         if out.ok() { "REACHED IT, CORRECTLY NAMED" } else { "DID NOT" },
         out.dispatch_thread,
@@ -306,7 +334,7 @@ mod tests {
     fn the_probe_crosses_three_times_identity_read_identity() {
         let mut dep = Fake::answering(THIS_MODULE);
         let p = probe(&mut dep, None);
-        assert_eq!(dep.seen, LEGS.to_vec());
+        assert_eq!(dep.seen, LEGS.map(Call::method).to_vec());
         assert_eq!(p.legs.len(), LEGS.len());
         assert_eq!(p.target, TARGET);
     }
