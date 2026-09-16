@@ -247,6 +247,15 @@ impl Run {
 
 // ── what to shield, and where it comes from ───────────────────────────
 
+/// An ERC-20 and what the probe's EOA holds of it, in that token's own
+/// smallest unit -- which is not the same unit twice, see [`DEFAULT_SHIELD`]
+/// and [`DEFAULT_WRAP_SHIELD`].
+#[derive(Debug, Clone, Copy)]
+pub struct Holding {
+    pub token: Address,
+    pub units: u128,
+}
+
 /// Everything the funding decision looks at. A struct rather than four
 /// arguments because [`plan`] is the one part of this probe that has to be
 /// right without a chain to check it against.
@@ -255,12 +264,12 @@ pub struct Purse {
     pub eoa: Address,
     pub wei: u128,
     /// The ERC-20 the run prefers, and how much of it the EOA holds.
-    pub erc20: (Address, u128),
+    pub erc20: Holding,
     /// The chain's wrapped base token and the EOA's balance of it -- the one
     /// ERC-20 this probe can MINT, out of its own ETH. `None` when the caller
     /// named an asset: then there is nothing to mint and a short balance is an
     /// ask.
-    pub wrapped: Option<(Address, u128)>,
+    pub wrapped: Option<Holding>,
 }
 
 /// What the probe will shield. `wrap` is the wei of the EOA's own ETH to turn
@@ -290,63 +299,65 @@ pub struct Plan {
 /// 5. ETH to cover gas AND the shortfall -> wrap the shortfall;
 /// 6. otherwise -> ask, in ETH.
 pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
-    let ask = |need: u128| {
-        let held = match purse.wrapped {
-            Some((w, units)) => format!(
-                "{} units of {} and {units} units of {w}",
-                purse.erc20.1, purse.erc20.0
-            ),
-            None => format!("{} units of {}", purse.erc20.1, purse.erc20.0),
-        };
-        let mint = match purse.wrapped {
-            Some((w, _)) => format!(
-                " ETH is ALL it needs: it mints its own ERC-20 by wrapping {} wei of it into \
-                 the chain's wrapped base token ({w}) and shielding that.",
-                need.saturating_sub(MIN_GAS_WEI)
-            ),
-            None => format!(
-                " This run named an asset ({}), and the only ERC-20 this probe can mint for \
-                 itself is the chain's wrapped base token -- so send that token too, or leave \
-                 `asset` unset.",
-                purse.erc20.0
-            ),
-        };
-        format!(
-            "fund {} on Sepolia with at least {need} wei of ETH: it holds {} wei and {held}.{mint} \
-             That address is FIXED (it is derived from a seed in rust-lib/src/live_send.rs), so \
-             this is a one-time step -- every run after it is unattended.",
-            purse.eoa, purse.wei
-        )
-    };
-
-    let (wrapped, held_wrapped) = match purse.wrapped {
-        Some((w, held)) => (Some(w), held),
-        None => (None, 0),
-    };
     // What a run would shield out of each source. One number cannot serve both:
     // the preferred ERC-20 is a 6-decimal stablecoin and the wrapped base token
     // is 18-decimal ETH.
     let want_erc20 = asked.unwrap_or(DEFAULT_SHIELD);
     let want_wrapped = asked.unwrap_or(DEFAULT_WRAP_SHIELD);
-    let shortfall = want_wrapped.saturating_sub(held_wrapped);
-    let full_ask = MIN_GAS_WEI.saturating_add(if wrapped.is_some() { shortfall } else { 0 });
+    // The wei a `wrap` leg would mint with, and so the one number an ask is:
+    // gas, plus whatever the wrapped balance is short of a shield. Zero when
+    // there is nothing to mint, which is what a named `asset` means.
+    let shortfall = purse.wrapped.map_or(0, |w| want_wrapped.saturating_sub(w.units));
+    let full_ask = MIN_GAS_WEI.saturating_add(shortfall);
+
+    let ask = || {
+        let (held, mint) = match purse.wrapped {
+            Some(w) => (
+                format!(
+                    "{} units of {} and {} units of {}",
+                    purse.erc20.units, purse.erc20.token, w.units, w.token
+                ),
+                format!(
+                    " ETH is ALL it needs: it mints its own ERC-20 by wrapping {shortfall} wei of \
+                     it into the chain's wrapped base token ({}) and shielding that.",
+                    w.token
+                ),
+            ),
+            None => (
+                format!("{} units of {}", purse.erc20.units, purse.erc20.token),
+                format!(
+                    " This run named an asset ({}), and the only ERC-20 this probe can mint for \
+                     itself is the chain's wrapped base token -- so send that token too, or leave \
+                     `asset` unset.",
+                    purse.erc20.token
+                ),
+            ),
+        };
+        format!(
+            "fund {} on Sepolia with at least {full_ask} wei of ETH: it holds {} wei and \
+             {held}.{mint} That address is FIXED (it is derived from a seed in \
+             rust-lib/src/live_send.rs), so this is a one-time step -- every run after it is \
+             unattended.",
+            purse.eoa, purse.wei
+        )
+    };
 
     if purse.wei < MIN_GAS_WEI {
-        return Err(ask(full_ask));
+        return Err(ask());
     }
-    if purse.erc20.1 >= want_erc20 {
-        return Ok(Plan { token: purse.erc20.0, shield: want_erc20, wrap: None });
+    if purse.erc20.units >= want_erc20 {
+        return Ok(Plan { token: purse.erc20.token, shield: want_erc20, wrap: None });
     }
-    let Some(wrapped) = wrapped else {
-        return Err(ask(MIN_GAS_WEI));
+    let Some(wrapped) = purse.wrapped else {
+        return Err(ask());
     };
-    if held_wrapped >= want_wrapped {
-        return Ok(Plan { token: wrapped, shield: want_wrapped, wrap: None });
+    if wrapped.units >= want_wrapped {
+        return Ok(Plan { token: wrapped.token, shield: want_wrapped, wrap: None });
     }
     if purse.wei >= full_ask {
-        return Ok(Plan { token: wrapped, shield: want_wrapped, wrap: Some(shortfall) });
+        return Ok(Plan { token: wrapped.token, shield: want_wrapped, wrap: Some(shortfall) });
     }
-    Err(ask(full_ask))
+    Err(ask())
 }
 
 /// Announce a stage BEFORE entering it: on a platform that kills the process
@@ -577,9 +588,9 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     };
     let purse: Result<Purse, String> = async {
         let wei = eoa.eth_balance()?;
-        let erc20 = (preferred, held(preferred).await?);
+        let erc20 = Holding { token: preferred, units: held(preferred).await? };
         let wrapped = match mintable {
-            Some(w) => Some((w, held(w).await?)),
+            Some(token) => Some(Holding { token, units: held(token).await? }),
             None => None,
         };
         Ok(Purse { eoa: eoa.address, wei, erc20, wrapped })
@@ -596,7 +607,7 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     let chosen = match plan(&purse, p.shield) {
         Ok(chosen) => chosen,
         Err(ask) => {
-            out.token_units = Some(purse.erc20.1);
+            out.token_units = Some(purse.erc20.units);
             out.needs_funding = Some(ask.clone());
             out.legs.push(Leg::failed("funding", Some(t.elapsed().as_millis()), ask));
             return out.finished(started);
@@ -606,10 +617,10 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     let shield_units = chosen.shield;
     let asset = AssetId::erc20(token);
     out.asset = Some(asset.to_string());
-    out.token_units = Some(if token == purse.erc20.0 {
-        purse.erc20.1
+    out.token_units = Some(if token == purse.erc20.token {
+        purse.erc20.units
     } else {
-        purse.wrapped.map(|(_, units)| units).unwrap_or_default()
+        purse.wrapped.map_or(0, |w| w.units)
     });
     out.legs.push(Leg::timed("funding", Some(t.elapsed().as_millis())));
 
@@ -1046,8 +1057,9 @@ mod tests {
         Purse {
             eoa: probe_eoa_address(),
             wei,
-            erc20: (SEPOLIA_USDC.parse().unwrap(), erc20),
-            wrapped: wrapped.map(|units| (ChainConfig::sepolia().wrapped_base_token, units)),
+            erc20: Holding { token: SEPOLIA_USDC.parse().unwrap(), units: erc20 },
+            wrapped: wrapped
+                .map(|units| Holding { token: ChainConfig::sepolia().wrapped_base_token, units }),
         }
     }
 
