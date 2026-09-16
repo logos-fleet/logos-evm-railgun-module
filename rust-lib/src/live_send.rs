@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::eips::eip2930::AccessList;
-use alloy::primitives::{keccak256, Address, Bytes, Signature, TxKind, B256, U256};
+use alloy::primitives::{keccak256, Address, Bytes, Signature, TxKind, U256};
 use alloy::signers::k256::ecdsa::{RecoveryId, SigningKey};
 use alloy::signers::utils::secret_key_to_address;
 use alloy::sol_types::SolCall;
@@ -111,12 +111,6 @@ pub const DEFAULT_SHIELD: u128 = 100_000;
 /// Gas the probe wants to see before it starts spending: a shield is ~250 k gas
 /// and a `transact` ~1.5 M, so at Sepolia's usual few gwei this is generous.
 pub const MIN_GAS_WEI: u128 = 5_000_000_000_000_000; // 0.005 ETH
-
-/// The tree the root question is asked about. RAILGUN opens a new tree every
-/// 65 536 commitments; Sepolia is still on its first, and the proof carries the
-/// tree it was built over, so this is read from the operation rather than assumed
-/// wherever the engine will tell us.
-const DEFAULT_TREE: u32 = 0;
 
 /// The probe's secp256k1 key. Deterministic, and derivable by anybody.
 pub fn probe_eoa_key() -> SigningKey {
@@ -278,7 +272,7 @@ impl<B: RpcBackend> Eoa<B> {
             "eth_getTransactionCount",
             json!([self.address.to_string(), "pending"]),
         )?)? as u64;
-        let base = quantity(&self.rpc("eth_gasPrice", json!([]))?)?;
+        let gas_price = quantity(&self.rpc("eth_gasPrice", json!([]))?)?;
         // A tip the node suggests, where it will suggest one; 1 gwei is Sepolia's
         // usual floor and an over-tip costs testnet dust.
         let tip = self
@@ -290,16 +284,17 @@ impl<B: RpcBackend> Eoa<B> {
             chain_id: self.chain_id,
             nonce,
             gas_limit,
-            // Room for two base-fee doublings, which is what a wallet does: the
-            // probe pays the base fee of the block it lands in, not this.
-            max_fee_per_gas: base.saturating_mul(2).saturating_add(tip),
+            // Room for the base fee to double before this lands, which is what
+            // a wallet does: the probe pays the base fee of the block it lands
+            // in, not this ceiling.
+            max_fee_per_gas: gas_price.saturating_mul(2).saturating_add(tip),
             max_priority_fee_per_gas: tip,
             to: TxKind::Call(to),
             value,
             access_list: AccessList::default(),
             input: data,
         };
-        let (_, _, raw) = sign_1559(&self.key, tx)?;
+        let (_, raw) = sign_1559(&self.key, tx)?;
         let sent = self.rpc(
             "eth_sendRawTransaction",
             json!([format!("0x{}", hex::encode(&raw))]),
@@ -340,7 +335,7 @@ impl<B: RpcBackend> Eoa<B> {
 
 /// Sign an EIP-1559 transaction. Split out of [`Eoa::send`] so a test can assert
 /// the signature recovers to the probe's own address without a chain.
-fn sign_1559(key: &SigningKey, tx: TxEip1559) -> Result<(B256, Signature, Vec<u8>), String> {
+fn sign_1559(key: &SigningKey, tx: TxEip1559) -> Result<(Signature, Vec<u8>), String> {
     let hash = tx.signature_hash();
     let (sig, recid): (_, RecoveryId) = key
         .sign_prehash_recoverable(hash.as_slice())
@@ -351,7 +346,7 @@ fn sign_1559(key: &SigningKey, tx: TxEip1559) -> Result<(B256, Signature, Vec<u8
         U256::from_be_slice(&bytes[32..]),
         recid.is_y_odd(),
     );
-    Ok((hash, signature, tx.into_signed(signature).encoded_2718()))
+    Ok((signature, tx.into_signed(signature).encoded_2718()))
 }
 
 // ── the run ─────────────────────────────────────────────────────────────────
@@ -482,23 +477,21 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
         eoa.send(token, U256::ZERO, data, gas).map(Some)
     }
     .await;
-    match approved {
+    let allowance_set = match approved {
         Ok(Some(tx)) => {
             out.approve_tx = Some(tx.clone());
-            if let Err(e) = eoa.wait(&tx, Duration::from_millis(p.confirm_ms)).await {
-                out.legs.push(Leg::failed("approve", Some(t.elapsed().as_millis()), e));
-                return out.finished(started);
-            }
-            out.legs.push(Leg::timed("approve", Some(t.elapsed().as_millis())));
+            eoa.wait(&tx, Duration::from_millis(p.confirm_ms)).await.map(|_| ())
         }
         // An allowance that is already enough is not a leg that did nothing: it
         // is the second run of the day, and saying so keeps the timings readable.
-        Ok(None) => out.legs.push(Leg::timed("approve", Some(t.elapsed().as_millis()))),
-        Err(e) => {
-            out.legs.push(Leg::failed("approve", Some(t.elapsed().as_millis()), e));
-            return out.finished(started);
-        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = allowance_set {
+        out.legs.push(Leg::failed("approve", Some(t.elapsed().as_millis()), e));
+        return out.finished(started);
     }
+    out.legs.push(Leg::timed("approve", Some(t.elapsed().as_millis())));
 
     // ── the shield: the ENGINE's calldata, this probe's signature ──────────
     entering("shield");
@@ -598,26 +591,27 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             return out.finished(started);
         }
     };
-    let mut tree = DEFAULT_TREE;
-    let mut merkleroot: Option<U256> = None;
+    // The root to ask the contract about, and the tree to ask it in: both read
+    // off the operation the engine produced rather than assumed. RAILGUN opens a
+    // new tree every 65 536 commitments, and asking `rootHistory` about the wrong
+    // one answers a confident `false`. `abis` is private to the engine, so the
+    // TYPE cannot be named here -- the fields can.
+    let mut proved_root: Option<(u32, U256)> = None;
     if let Some(op) = proved.proved_operations.first() {
         out.circuit = Some(format!(
             "{:02}x{:02}",
             op.circuit_inputs.nullifiers.len(),
             op.circuit_inputs.commitments_out.len()
         ));
-        merkleroot = Some(op.circuit_inputs.merkleroot.into());
-        // The tree the proof was built over, read off the operation the engine
-        // produced rather than assumed: RAILGUN opens a new tree every 65 536
-        // commitments, and asking `rootHistory` about the wrong one answers a
-        // confident `false`. `abis` is private to the engine, so the TYPE cannot
-        // be named here -- the field can.
-        tree = op.transaction.boundParams.treeNumber as u32;
+        proved_root = Some((
+            op.transaction.boundParams.treeNumber as u32,
+            op.circuit_inputs.merkleroot.into(),
+        ));
     }
     out.calldata_bytes = Some(proved.tx_data.data.len());
 
     // ── and the boolean this whole module is about ─────────────────────────
-    if let Some(root) = merkleroot {
+    if let Some((tree, root)) = proved_root {
         entering("root-on-chain");
         let t = Instant::now();
         let seen = eip1193
@@ -658,19 +652,17 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             .and_then(|gas| {
                 eoa.send(proved.tx_data.to, proved.tx_data.value, proved.tx_data.data.clone(), gas)
             });
-        match sent {
+        let mined = match sent {
             Ok(tx) => {
                 out.transfer_tx = Some(tx.clone());
-                match eoa.wait(&tx, Duration::from_millis(p.confirm_ms)).await {
-                    Ok(block) => {
-                        out.transfer_block = Some(block);
-                        out.legs.push(Leg::timed("broadcast", Some(t.elapsed().as_millis())));
-                    }
-                    Err(e) => {
-                        out.legs.push(Leg::failed("broadcast", Some(t.elapsed().as_millis()), e));
-                        return out.finished(started);
-                    }
-                }
+                eoa.wait(&tx, Duration::from_millis(p.confirm_ms)).await
+            }
+            Err(e) => Err(e),
+        };
+        match mined {
+            Ok(block) => {
+                out.transfer_block = Some(block);
+                out.legs.push(Leg::timed("broadcast", Some(t.elapsed().as_millis())));
             }
             Err(e) => {
                 out.legs.push(Leg::failed("broadcast", Some(t.elapsed().as_millis()), e));
@@ -860,8 +852,7 @@ mod tests {
             input: Bytes::new(),
         };
         let hash = tx.signature_hash();
-        let (signed_hash, signature, raw) = sign_1559(&probe_eoa_key(), tx).expect("sign");
-        assert_eq!(signed_hash, hash);
+        let (signature, raw) = sign_1559(&probe_eoa_key(), tx).expect("sign");
         let recid = RecoveryId::from_byte(u8::from(signature.v())).expect("parity");
         let sig = alloy::signers::k256::ecdsa::Signature::from_scalars(
             signature.r().to_be_bytes::<32>(),
