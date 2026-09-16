@@ -16,6 +16,7 @@ pub mod engine;
 pub mod keys;
 pub mod relay;
 pub mod rpc_backend;
+pub mod web_dependency;
 pub mod witness_engine;
 
 #[cfg(feature = "logos_module")]

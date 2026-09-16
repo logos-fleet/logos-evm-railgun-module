@@ -45,6 +45,7 @@ use userop_kit::signable_user_operation::SignableUserOperation;
 use crate::engine::RailgunEngine;
 use crate::relay;
 use crate::rpc_backend::RpcBackend;
+use crate::web_dependency::{self, Dependency, Leg};
 use crate::witness_engine;
 
 pub trait RailgunModule: 'static {
@@ -108,6 +109,22 @@ pub trait RailgunModule: 'static {
     /// the JIT also says what would work instead. Safe to call before `init`.
     /// See [`crate::witness_engine`].
     fn witness_engine_probe(&mut self) -> String;
+    /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
+    /// `{ ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread,
+    /// callerKind, callerIdentity, callerIsThisModule,
+    /// legs: [{ method, ms, ok, reply?, error? }] }`.
+    ///
+    /// On a phone `keystore_module` is a `web` (wasm) variant — a page in the
+    /// Shell's container — and this module is native, Bare and in-process.
+    /// ADR 0010 lets a Bundled member depend on the image's web half, which is
+    /// what puts this module in the mobile catalog at all, and it rests on the
+    /// host's claim that a consumer reaches a Web module exactly as it reaches
+    /// a subprocess one. This asks that claim on the device: three ordinary
+    /// crossings to the dependency, timed, with the name the page believes
+    /// called it, and the thread the dispatch ran on beside the one the image
+    /// was loaded on. No chain, no keys, no engine — safe to call before
+    /// `init`. See [`crate::web_dependency`].
+    fn web_dependency_probe(&mut self) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -441,6 +458,67 @@ impl RailgunModule for RailgunModuleImpl {
         reply["alternatives"] = Value::Array(alternatives.iter().map(probe_json).collect());
         reply.to_string()
     }
+
+    fn web_dependency_probe(&mut self) -> String {
+        let p = web_dependency::probe(&mut BusDependency::new(), LOAD_THREAD.get().cloned());
+        json!({
+            "ok": p.ok(),
+            "target": p.target,
+            "dispatchThread": p.dispatch_thread,
+            "loadThread": p.load_thread,
+            "dispatchLeftTheLoadThread": p.dispatch_left_the_load_thread(),
+            "callerKind": p.saw_kind,
+            "callerIdentity": p.saw_identity,
+            "callerIsThisModule": p.identity_is_this_module(),
+            "legs": p.legs.iter().map(|l: &Leg| json!({
+                "method": l.method,
+                "ms": l.ms,
+                "ok": l.ok(),
+                "reply": l.reply,
+                "error": l.error,
+            })).collect::<Vec<Value>>(),
+        })
+        .to_string()
+    }
+}
+
+/// The dependency, reached over the module bus.
+///
+/// A raw `PluginProxy` rather than `modules().keystore_module`, and the two are
+/// the same call: a LIDL-generated wrapper for a `String`-returning method IS
+/// `proxy.call_json(method, [])` with the answer unwrapped. It is the proxy so
+/// that the probe still asks its question against a `keystore_module` pin whose
+/// generated contract predates `caller_identity` — which this crate's own
+/// flake.lock is. [`crate::web_dependency`] has the rest of the reasoning.
+struct BusDependency(logos_rust_sdk::PluginProxy);
+
+impl BusDependency {
+    fn new() -> Self {
+        Self(logos_rust_sdk::LogosModuleSDK::new().plugin(web_dependency::TARGET))
+    }
+
+    /// One no-argument call. The reply is a `String` on the contract, so the
+    /// transport hands back a JSON string; anything else is forwarded verbatim
+    /// rather than discarded, so an unexpected shape is reported and not hidden.
+    fn call(&self, method: &str) -> Result<String, String> {
+        let value = self
+            .0
+            .call_json(method, &Value::Array(vec![]))
+            .map_err(|e| e.to_string())?;
+        Ok(match value.as_str() {
+            Some(text) => text.to_string(),
+            None => value.to_string(),
+        })
+    }
+}
+
+impl Dependency for BusDependency {
+    fn caller_identity(&mut self) -> Result<String, String> {
+        self.call("caller_identity")
+    }
+    fn list_accounts(&mut self) -> Result<String, String> {
+        self.call("list_accounts")
+    }
 }
 
 impl RailgunModuleImpl {
@@ -560,7 +638,15 @@ impl RailgunModuleImpl {
     }
 }
 
+/// The thread this image was LOADED on, recorded once by the host's own load
+/// call. The host loads an in-process module on the thread it delivers calls
+/// on, and `BareModuleGlue` then dispatches on a worker of its own — so this
+/// is the other end of the comparison `web_dependency_probe` reports, and the
+/// only way to take it is from inside the load. See [`crate::web_dependency`].
+static LOAD_THREAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 #[no_mangle]
 pub extern "Rust" fn logos_module_install() {
+    let _ = LOAD_THREAD.set(web_dependency::thread_id());
     install::<RailgunModuleImpl>();
 }
