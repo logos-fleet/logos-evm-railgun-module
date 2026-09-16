@@ -660,6 +660,56 @@ A Groth16 proof the contract's verifier rejects costs a `status: 0x0` receipt,
 which `wait` reports as an error — so a green `broadcast` leg is the chain's own
 verdict on the proof.
 
+#### And the same run, inside the Shell, on Apple hardware
+
+An iOS **simulator** shares the Mac's loopback, so the fork above is reachable
+from a Bundled-set Shell without exposing anything. On an iPad Air 13-inch (M2)
+simulator, release build, `railgun_module` + `capability_module`:
+
+```bash
+ws run logos-basecamp --target ios-sim-arm64 --app shell \
+   --bundle railgun_module,capability_module \
+   -- --call 'eth_rpc_module.init_defaults()' \
+      --call 'eth_rpc_module.patch_chain_endpoint(int:11155111, str:http://127.0.0.1:8645)' \
+      --call 'railgun_module.live_send_probe(str:{})'
+```
+
+```
+railgun_module: live-send probe: SENT (chain=11155111 node=Some("anvil/v1.8.1")
+  FORK-NOT-PUBLIC-SEPOLIA circuit=Some("02x02") shielded=Some(249375000000000)
+  rootOnChain=Some(true) calldata=Some(1988)B funding=2ms wrap=2201ms engine=7ms
+  approve=2207ms shield=2320ms sync=140045ms balance=0ms transfer=3719ms
+  broadcast=3970ms total=154490ms)
+```
+
+Both transactions were mined by the RAILGUN contract — shield `status 0x1`,
+726 008 gas, 3 events; the proved `transact(...)` `status 0x1`, 1 045 447 gas,
+2 events. So the merkle proof, the witness, the Groth16 proof and the calldata a
+Logos module produced on Apple hardware were accepted by the contract's own
+verifier. `int:` on the chain id is not optional: the Shell's `--call` arguments
+are strings unless they say otherwise, and `patch_chain_endpoint(11155111, …)`
+is refused with `expected integer at arg0, got string`.
+
+**AND THE DRIVER CANNOT WAIT FOR IT.** `ShellCallDriver`'s per-call budget is
+60 000 ms and the send takes **154 s**, 140 s of which is the tree sync:
+
+```
+[shell] CALL FAILED railgun_module.live_send_probe(str:{}): call to
+        'railgun_module.live_send_probe' timed out after 60000ms (timeout)
+[shell] CALLS: 2 ok, 1 failed
+… 94 seconds later …
+railgun_module: live-send probe: SENT (… rootOnChain=Some(true) …)
+```
+
+The module carried on and finished; only the waiter gave up, which is why the
+console line is the evidence and `CALLS: 2 ok, 1 failed` is not. #188 asked
+whether a private send on iOS needs a progress UI and a cancel path, and could
+only answer for the witness (817 ms). This is the answer for the whole
+operation: **yes, and by a wide margin** — and the cost is not the proving
+(`transfer` = 3.7 s here, witness and Groth16 together, release build) but the
+one-off sync of the accumulator, which is the part a UI can show progress for
+and a user can be asked to wait through once.
+
 **What this is NOT.** The funds were conjured by the node, and the blocks were
 produced on this desk. `rootOnChain: true` here says the engine's tree agrees
 with the contract's on a chain nobody else is writing to — which is the whole of
