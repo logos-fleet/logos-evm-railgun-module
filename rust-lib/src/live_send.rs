@@ -1005,6 +1005,38 @@ mod tests {
         );
     }
 
+    // WOULD A REAL NODE TAKE THIS TRANSACTION? The signature is the one part of
+    // the send that nothing checks until it costs gas, and `sign_1559` above can
+    // only prove it recovers to the right address with the same library that
+    // produced it. So ask a node: a transaction from an EMPTY account is refused
+    // for **funds**, and a transaction whose signature does not recover is
+    // refused for the SENDER. Getting the first error is the evidence.
+    //
+    //   cargo test --features engine_seam -- --ignored --nocapture a_real_node
+    #[test]
+    #[ignore = "needs the network; asks a real Sepolia node to reject a signed transaction"]
+    fn a_real_node_refuses_the_probes_transaction_for_funds_not_for_its_sender() {
+        let eoa = Eoa::new(RealSepolia::new(), SEPOLIA);
+        // Once the EOA is funded this would really send, so it does not run
+        // there: the question is only interesting while the account is empty.
+        let wei = eoa.eth_balance().expect("balance");
+        if wei > 0 {
+            eprintln!("live-send: {} holds {wei} wei -- skipped, this test spends", eoa.address);
+            return;
+        }
+        // 1 wei to itself: correct in every respect except the balance behind it.
+        let err = eoa
+            .send(eoa.address, U256::from(1), Bytes::new(), 21_000)
+            .expect_err("an empty account cannot pay for a transaction");
+        eprintln!("live-send: a real Sepolia node answered: {err}");
+        let said = err.to_lowercase();
+        assert!(said.contains("funds") || said.contains("balance"), "{err}");
+        assert!(
+            !said.contains("sender") && !said.contains("signature"),
+            "the node did not recover the sender from our signature: {err}"
+        );
+    }
+
     // THE WHOLE THING, ON CHAIN. `#[ignore]` because it spends testnet money and
     // waits on blocks — not because it is optional: it is #213's acceptance
     // clause 1, and a green run here is a shield mined, a proof the contract

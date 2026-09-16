@@ -579,6 +579,22 @@ two probes measured) whatever the RAILGUN shield fee took.
 builds the engine and syncs the whole Sepolia UTXO tree — **31.2 s** on
 aarch64-darwin, dev profile, against a public RPC.
 
+**And the signature is checked by a node rather than by the library that made
+it.** `sign_1559` can only prove to itself that its output recovers to the right
+address, so `a_real_node_refuses_the_probes_transaction_for_funds_not_for_its_sender`
+submits a real signed transaction from the empty EOA and asserts on WHICH
+refusal comes back — a transaction whose signature does not recover is refused
+for its *sender*, one that is merely unaffordable is refused for *funds*:
+
+```
+{"code":-32003,"message":"insufficient funds for gas * price + value:
+                          have 0 want 46257038142001"}
+```
+
+So the encoding, the EIP-1559 envelope and the ECDSA recovery are all confirmed
+by Sepolia itself; only the balance is missing. (That figure is also the going
+rate: ~0.000046 ETH for a 21 000-gas transfer, so 0.01 ETH is a great many runs.)
+
 ```bash
 # on the host, the whole thing (spends testnet funds, waits on blocks)
 cargo test --features engine_seam -- --ignored --nocapture the_whole_send
