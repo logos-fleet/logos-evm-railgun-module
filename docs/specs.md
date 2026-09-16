@@ -190,6 +190,51 @@ does (#188) — in which case there is no reply at all. Each stage is therefore
 also printed on stderr before it is entered, so a device console still names the
 stage the silence began in.
 
+### `witness_circuit_probe(params_json) → { ok, circuit, artifactUrl, downloadMs, wasmBytes, sanityCheck, probes }`
+**And how LONG does a witness take here?** `witness_engine_probe` answers whether
+a backend may run; this answers what it costs, over the circuit the engine really
+proves with. It matters because the backend a physical iOS device permits is an
+*interpreter* — `wasmi` emits no machine code, which is exactly why iOS accepts
+it and exactly why it is slower than the JIT it replaces. "It no longer crashes"
+with no number attached does not tell anyone whether a private send is a button
+or a background job.
+
+`{ "circuit"?: "01x02", "backends"?: ["wasmi", …] }` — both optional. `circuit`
+is a transact circuit name (`NNxMM`: NN notes spent, MM commitments out);
+`backends` defaults to every backend in the image, the engine's own LAST.
+
+Each entry of `probes` carries `requested`, `backend`, `reached`
+(`engine` → `compile` → `instantiate` → `signals` → `witness`), `compileMs`,
+`instantiateMs`, **`witnessMs`** — the number this exists for — `witnessLen`,
+`witnessNonzero`, `signals` and `error`. `downloadMs` is the artifact fetch,
+once, outside every backend's timing.
+
+What it is faithful about: the artifact (the engine's own base URL, same
+`wasm.br`, same brotli), the calculator (`ark_circom::WitnessCalculator`), the
+store, the backend and the device. What it is NOT: the input VALUES. A valid
+RAILGUN witness input needs a shielded note, a merkle proof over a tree that
+contains it and an EdDSA signature over the public hash — a funded, synced
+wallet — and every type that builds one (`circuit`, `merkle_tree`, `note`) is
+private in the engine crate. So it feeds the circuit's real SHAPE filled with
+placeholders and turns circom's sanity check off (`sanityCheck: false` in the
+reply, so no reader has to assume). That costs the timing nothing: a circom
+witness calculator is straight-line code over a fixed circuit, and the number of
+field operations does not depend on the values. It proves nothing about a proof
+*verifying*.
+
+**The shape is checked against the circuit, not assumed.** A circom calculator
+does not fail on too few signals — the computation is triggered by the last
+input arriving, so a short input set means the circuit never runs and the witness
+comes back instantly and empty, which reads as a wonderful measurement. Every
+signal is therefore put to the circuit's own `getInputSignalSize` first and a
+mismatch is reported instead of timed (`reached: "instantiate"`, `error` naming
+the signal).
+
+Needs the network (~900 KB) and no chain, keys or shielded balance. On a device
+where the JIT kills the process, name `["wasmi"]` alone so the reply survives —
+otherwise each backend's result is still printed on stderr as it completes, for
+the same reason `witness_engine_probe` narrates its stages.
+
 ### `web_dependency_probe() → { ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread, callerKind, callerIdentity, callerIsThisModule, legs }`
 **Can this module reach its `web` dependency from a handset?** On a phone
 `keystore_module` is a `web` (wasm) variant — a page in the Shell's container —

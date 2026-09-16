@@ -4288,12 +4288,16 @@ name = "railgun_module"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "ark-circom",
  "async-trait",
+ "brotli",
  "eip-1193-provider",
  "hex",
  "logos-rust-sdk",
+ "num-bigint",
  "railgun",
  "rand 0.9.4",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

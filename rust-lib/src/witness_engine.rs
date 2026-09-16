@@ -158,7 +158,10 @@ impl Backend {
         }
     }
 
-    fn store(self) -> Store {
+    /// The store this backend builds. `pub(crate)` because
+    /// [`crate::witness_circuit`] measures the SAME backends over the real
+    /// circuit: one list of what is in the image, two questions asked of it.
+    pub(crate) fn store(self) -> Store {
         match self {
             Backend::EngineDefault => Store::default(),
             #[cfg(not(any(target_os = "android", target_abi = "sim")))]
