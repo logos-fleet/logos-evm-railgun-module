@@ -272,6 +272,23 @@ impl Run {
         self.legs.iter().find(|l| l.name == name)
     }
 
+    /// The wasm backend the ENGINE generates its witness on in THIS image —
+    /// [`crate::proof_circuit::ENGINE_BACKEND`], which is character for
+    /// character the cfg `patch-kohaku-witness-backend.sh` writes into the
+    /// vendored `calculate_witness`.
+    ///
+    /// #213 clause 2 is evidenced by a line the VENDORED engine prints
+    /// (`railgun: witness store backend = wasmi (#188 iOS: the interpreter, no
+    /// JIT)`), which belongs to a different crate and never reaches a caller
+    /// that reads the result as JSON. Naming it here puts the backend in the
+    /// same line — and the same object — as `rootOnChain` and the timings.
+    ///
+    /// A method rather than a field because it is a property of the BUILD, not
+    /// of the run: a run that stopped at `funding` knows it just as well.
+    pub fn witness_backend(&self) -> &'static str {
+        crate::proof_circuit::ENGINE_BACKEND.requested()
+    }
+
     fn finished(mut self, started: Instant) -> Run {
         self.total_ms = started.elapsed().as_millis();
         report(&self);
@@ -922,9 +939,23 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
 /// Print the result as it completes: on a platform that kills the process the
 /// console line is the only thing that survives.
 pub fn report(r: &Run) {
+    eprintln!("{}", summary(r));
+    if let Some(ask) = &r.needs_funding {
+        eprintln!("railgun_module: live-send probe: NEEDS FUNDING -- {ask}");
+    }
+    for l in r.legs.iter().filter(|l| !l.ok()) {
+        eprintln!("railgun_module: live-send probe: {} -> {:?}", l.name, l.error);
+    }
+}
+
+/// The one line the whole run is judged by, as a value rather than as a side
+/// effect — so a test can read it, and so a caller that has somewhere better to
+/// put it than stderr can.
+pub fn summary(r: &Run) -> String {
     let leg = |n: &str| r.leg(n).and_then(|l| l.ms);
-    eprintln!(
-        "railgun_module: live-send probe: {} (chain={} node={:?}{} eoa={:?} circuit={:?} \
+    format!(
+        "railgun_module: live-send probe: {} (chain={} node={:?}{} witnessBackend={:?} \
+         eoa={:?} circuit={:?} \
          shielded={:?} transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} \
          shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
          approve={:?}ms shield={:?}ms sync={:?}ms balance={:?}ms transfer={:?}ms \
@@ -933,6 +964,7 @@ pub fn report(r: &Run) {
         r.chain_id,
         r.node,
         if r.forked { " FORK-NOT-PUBLIC-SEPOLIA" } else { "" },
+        r.witness_backend(),
         r.eoa,
         r.circuit,
         r.balance,
@@ -953,13 +985,7 @@ pub fn report(r: &Run) {
         leg("transfer"),
         leg("broadcast"),
         r.total_ms,
-    );
-    if let Some(ask) = &r.needs_funding {
-        eprintln!("railgun_module: live-send probe: NEEDS FUNDING -- {ask}");
-    }
-    for l in r.legs.iter().filter(|l| !l.ok()) {
-        eprintln!("railgun_module: live-send probe: {} -> {:?}", l.name, l.error);
-    }
+    )
 }
 
 #[cfg(test)]
@@ -1104,6 +1130,43 @@ mod tests {
     // chain, so the report has to name its node rather than leave the
     // distinction in a human's memory: `anvil/v1.8.1` is a fork, `erigon/…` or
     // `Nethermind/…` is not.
+    /// #213 clause 2 asks for the backend the engine's OWN `calculate_witness`
+    /// chose, and on a device that evidence is a line the VENDORED engine
+    /// prints — a different line, from a different crate, which a machine-read
+    /// result never sees. So the run's own summary names it too, and one line
+    /// then carries the backend beside `rootOnChain` and the timings.
+    #[test]
+    fn the_run_names_the_backend_the_engine_proves_with() {
+        let chain = Canned::with(&[
+            ("web3_clientVersion", json!("anvil/v1.8.1")),
+            ("eth_getBalance", json!("0x0")),
+            ("eth_call", word(0)),
+        ]);
+        let out = block_on(run(chain, Params::default()));
+        assert_eq!(
+            out.witness_backend(),
+            crate::proof_circuit::ENGINE_BACKEND.requested(),
+            "the run must name the backend THIS image's engine proves with"
+        );
+        assert!(
+            summary(&out).contains(&format!("witnessBackend={:?}", out.witness_backend())),
+            "the summary does not name the backend: {}",
+            summary(&out)
+        );
+    }
+
+    /// And the name is read off the platform rather than typed: the interpreter
+    /// is the answer on a physical iOS device and nowhere else (#188).
+    #[test]
+    fn only_a_physical_ios_device_proves_on_the_interpreter() {
+        let want = if cfg!(all(target_os = "ios", not(target_abi = "sim"))) {
+            "wasmi"
+        } else {
+            "engine-default"
+        };
+        assert_eq!(Run::default().witness_backend(), want);
+    }
+
     #[test]
     fn the_run_names_the_node_that_answered() {
         let chain = Canned::with(&[

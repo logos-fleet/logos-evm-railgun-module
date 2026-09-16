@@ -504,7 +504,7 @@ LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
   `no configuration for chain 11155111`. `init_defaults()` is idempotent and
   persists, so it is needed on the first launch only.
 
-### `live_send_probe(params_json) → { ok, chainId, node, forked, eoa, ethWei, tokenUnits, needsFunding, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx, shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
+### `live_send_probe(params_json) → { ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits, needsFunding, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx, shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
 **The same send with NOTHING substituted: on chain, mined, and accepted by the
 contract** (#213 acceptance clause 1).
 
@@ -736,6 +736,83 @@ LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
      -- --call 'eth_rpc_module.init_defaults()' \
         --call 'railgun_module.live_send_probe(str:{})'
 ```
+
+#### AND THE SAME SEND ON A PHYSICAL HANDSET, WHICH IS THE ONE THAT MATTERS
+
+A simulator proves nothing about #188: `Store::default()` there is the JIT, and
+the cfg `patch-kohaku-witness-backend.sh` writes is compiled out. The physical
+device is the only place the engine's own `calculate_witness` takes the
+interpreter — and it can be pointed at a fork after all.
+
+**A physical device cannot reach a server on the Mac over Wi-Fi.** It is on the
+same LAN and the Mac answers `curl` on its LAN address, but the app gets
+`tcp connect error: No route to host (os error 65)` — iOS local-network privacy
+refusing an app with no granted prompt, and a prompt on a handset cannot be
+tapped from here. **The CoreDevice tunnel is not refused.** Xcode's device
+tunnel is a point-to-point utun carrying a ULA /64 on which the DEVICE is `::1`
+and the MAC is `::2`:
+
+```bash
+xcrun devicectl device info details --device <core-device-id> --json-output d.json
+#   .connectionProperties.tunnelIPAddress = fd77:581c:64fd::1   <- the DEVICE
+ifconfig | grep -B2 'fd77:581c:64fd'   # utun -> fd77:581c:64fd::2, the MAC
+
+anvil --fork-url https://ethereum-sepolia-rpc.publicnode.com --port 8645 \
+      --host 127.0.0.1 --host fd77:581c:64fd::2 --chain-id 11155111 --silent &
+
+LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<core-device-id> \
+  ws run logos-basecamp --target ios-arm64 --app shell \
+     --bundle railgun_module,capability_module \
+     --local logos-evm-railgun-module \
+     -- --call 'eth_rpc_module.init_defaults()' \
+        --call 'eth_rpc_module.patch_chain_endpoint(int:11155111, str:http://[fd77:581c:64fd::2]:8645)' \
+        --call 'railgun_module.live_send_probe(str:{})'
+```
+
+The prefix is minted per tunnel, so re-read it every session; the URL needs the
+IPv6 brackets; and the Mac can neither ping nor `curl` its OWN `::2` (the link
+is point-to-point), so `netstat -an -p tcp | grep 8645` is the only proof the
+bind took. Keep loopback bound for your own calls.
+
+**iPad Air (4th generation), iOS 26.5.2, release build, forked at Sepolia block
+11 719 924:**
+
+```
+railgun_module: live-send probe: SENT (chain=11155111 node=Some("anvil/v1.8.1")
+  FORK-NOT-PUBLIC-SEPOLIA witnessBackend="wasmi"
+  eoa=Some("0x23cc…1722") circuit=Some("01x02") shielded=Some(99750000000000)
+  transferred=Some(49875000000000) rootOnChain=Some(true)
+  asset=Some("erc20:0xfff9…6b14") calldata=Some(1956)B
+  funding=454ms wrap=2882ms engine=10ms approve=391ms shield=4120ms
+  sync=210101ms balance=0ms transfer=3912ms broadcast=4056ms total=226014ms)
+```
+
+`railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)` is
+printed immediately before the `transfer` leg — from inside the vendored
+`calculate_witness`, over the real circuit inputs of a note the contract's own
+tree holds, rather than over the shape-correct placeholders `proof_circuit_probe`
+must use. Both transactions were mined by the RAILGUN contract: shield
+`status 0x1`, block 11 719 927, 731 371 gas, 3 events; the proved `transact(...)`
+`status 0x1`, block 11 719 928, **1 008 286 gas**, 2 events, to
+`0xeCFCf3b4…3fea`. The contract's verifier accepted a Groth16 proof an A14 iPad
+produced **on the interpreter**.
+
+**What the interpreter costs, end to end: almost nothing.** `transfer` — the
+engine's own witness, `Groth16Prover::prove`, verify and the artifact fetch —
+is **3912 ms** on the A14 under `wasmi`, against **3719 ms** on an M2 simulator
+under cranelift and #222's `total=4509ms` for the same three legs over
+placeholder values. The 226 s a private send takes on this handset is **210 s of
+accumulator sync**; the proving half is under 2 % of it. So a progress UI and a
+cancel path are needed for the SYNC, and #188's JIT-off patch costs the user
+nothing measurable.
+
+**And `witnessBackend` is in the result, not only in the console.** The
+`railgun: witness store backend = …` line belongs to the vendored engine and
+never reaches a caller reading JSON, so `Run::witness_backend()` reports the same
+cfg (`proof_circuit::ENGINE_BACKEND`) in the summary line and in
+`live_send_probe`'s object — one line then carries the backend, `rootOnChain` and
+the timings together.
+
 
 The same two Bundled-set requirements as `private_send_probe` apply —
 `capability_module` in the set, and one `eth_rpc_module.init_defaults()` on a

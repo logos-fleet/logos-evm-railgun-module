@@ -189,10 +189,18 @@ pub trait RailgunModule: 'static {
     /// AND THE SAME SEND WITH NOTHING SUBSTITUTED — ON CHAIN, MINED, AND
     /// ACCEPTED BY THE CONTRACT.
     /// `{ "asset"?, "shield"?, "transfer"?, "memo"?, "broadcast"?, "confirmMs"? }`
-    /// → `{ ok, chainId, eoa, ethWei, tokenUnits, needsFunding?, asset, from, to,
+    /// → `{ ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits,
+    /// needsFunding?, asset, wrappedWei, wrapTx, from, to,
     /// approveTx, shieldTx, shieldBlock, balance, transferred, circuit,
     /// rootOnChain, calldataBytes, transferTx, transferBlock, totalMs,
     /// legs: [{ name, ms, ok, error? }] }`.
+    ///
+    /// `node` / `forked` say WHOSE chain answered, because a fork of Sepolia
+    /// prints byte-identical lines to the public chain. `witnessBackend` is the
+    /// backend the engine's own `calculate_witness` used — `wasmi` on a physical
+    /// iOS device (#188), the platform default everywhere else — and it is here
+    /// because the engine announces it on stderr, where a caller reading this
+    /// object never sees it (#213 clause 2).
     ///
     /// [`Self::private_send_probe`] fabricates exactly one thing — the `Shield`
     /// event — and says so with `rootOnChain: false`. This fabricates nothing:
@@ -833,6 +841,10 @@ impl RailgunModule for RailgunModuleImpl {
             // a desk is indistinguishable from a run on the public chain.
             "node": run.node,
             "forked": run.forked,
+            // The backend the ENGINE's own `calculate_witness` used (#213
+            // clause 2). The vendored engine prints it on stderr; a caller that
+            // reads this JSON never sees that line, so the run carries it.
+            "witnessBackend": run.witness_backend(),
             "eoa": run.eoa,
             // Decimal strings for the same reason the params are.
             "ethWei": run.eth_wei.map(|v| v.to_string()),
