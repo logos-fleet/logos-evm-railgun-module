@@ -458,11 +458,13 @@ impl RailgunModule for RailgunModuleImpl {
     }
 
     fn web_dependency_probe(&mut self) -> String {
-        let p = web_dependency::probe(&mut BusDependency::new());
+        let p = web_dependency::probe(&mut BusDependency::new(), LOAD_THREAD.get().cloned());
         json!({
             "ok": p.ok(),
             "target": p.target,
-            "thread": p.thread,
+            "dispatchThread": p.dispatch_thread,
+            "loadThread": p.load_thread,
+            "dispatchLeftTheLoadThread": p.dispatch_left_the_load_thread(),
             "callerKind": p.saw_kind,
             "callerIdentity": p.saw_identity,
             "callerIsThisModule": p.identity_is_this_module(),
@@ -635,7 +637,15 @@ impl RailgunModuleImpl {
     }
 }
 
+/// The thread this image was LOADED on, recorded once by the host's own load
+/// call. The host loads an in-process module on the thread it delivers calls
+/// on, and `BareModuleGlue` then dispatches on a worker of its own — so this
+/// is the other end of the comparison `web_dependency_probe` reports, and the
+/// only way to take it is from inside the load. See [`crate::web_dependency`].
+static LOAD_THREAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 #[no_mangle]
 pub extern "Rust" fn logos_module_install() {
+    let _ = LOAD_THREAD.set(web_dependency::thread_id());
     install::<RailgunModuleImpl>();
 }

@@ -40,13 +40,18 @@
 //!   then refused everybody. That defect was fixed and measured in the `web` →
 //!   `web` direction; this is the native → `web` one, which has never been
 //!   asked. [`Probe::identity_is_this_module`] is the whole of that question.
-//! * **Whether it blocks.** A Bare module never dispatches on the thread the
-//!   call arrived on — `BareModuleGlue` marshals every dispatch onto the glue's
-//!   own worker — while a page answers on the host's Qt main thread. So the
-//!   thread that waits here must NOT be the thread that has to deliver, and
-//!   [`Probe::thread`] is what says which one it was. A `single` module that
-//!   waited on the delivering thread is the deadlock shape uniswap_module hit
-//!   on the `multi` side, and it would present as a leg that never returns.
+//! * **Whether it blocks.** A page answers on the host's Qt main thread, so a
+//!   module that waited for it ON that thread would be waiting on the thread
+//!   that has to deliver — the deadlock shape uniswap_module hit on the `multi`
+//!   side, presenting here as a leg that never returns. What is supposed to
+//!   prevent it is `BareModuleGlue`: an in-process module never dispatches on
+//!   the thread the call arrived on, the glue marshals every dispatch onto its
+//!   own worker. [`Probe::dispatch_thread`] and [`Probe::load_thread`] are that
+//!   arrangement asked rather than assumed — the image is loaded on the host's
+//!   loading thread and dispatched on the worker, so the two DIFFERING is the
+//!   evidence. Neither is an OS thread id: `std::thread::ThreadId` is a
+//!   per-image counter handed out on first use, which makes it good for
+//!   comparing two threads of the same image and worthless for anything else.
 //!
 //! THE CALLS ARE UNTYPED, deliberately. The generated `modules().keystore_module`
 //! client would be the idiomatic spelling, and it is *literally* this — a
@@ -106,7 +111,11 @@ pub struct Probe {
     /// The dependency that was called.
     pub target: &'static str,
     /// The thread the probe — and therefore this module's dispatch — ran on.
-    pub thread: String,
+    pub dispatch_thread: String,
+    /// The thread this module's image was LOADED on, if it was recorded. The
+    /// host's loading thread, which for an in-process module is the Qt main
+    /// thread the pages also answer on.
+    pub load_thread: Option<String>,
     /// Every leg, in the order they were made. Always [`LEGS`] long: a leg that
     /// fails does not end the probe, because "the first call failed" and "the
     /// transport is gone" are different findings.
@@ -134,6 +143,14 @@ impl Probe {
     /// The dependency named THIS module as its caller.
     pub fn identity_is_this_module(&self) -> bool {
         self.saw_identity.as_deref() == Some(THIS_MODULE)
+    }
+
+    /// The dispatch ran somewhere other than the thread the image was loaded
+    /// on — `BareModuleGlue`'s worker rather than the host's delivering thread.
+    /// `None` when the load thread was not recorded, which is not the same
+    /// answer as `Some(false)` and must not be reported as one.
+    pub fn dispatch_left_the_load_thread(&self) -> Option<bool> {
+        self.load_thread.as_ref().map(|t| *t != self.dispatch_thread)
     }
 }
 
@@ -169,10 +186,11 @@ fn identity_of(reply: &str) -> (Option<String>, Option<String>) {
 
 /// Cross to the dependency three times and report what happened, whatever
 /// happened. Never panics; never returns early.
-pub fn probe(dep: &mut impl Dependency) -> Probe {
+pub fn probe(dep: &mut impl Dependency, load_thread: Option<String>) -> Probe {
     let mut out = Probe {
         target: TARGET,
-        thread: thread_name(),
+        dispatch_thread: thread_id(),
+        load_thread,
         legs: Vec::with_capacity(LEGS.len()),
         saw_kind: None,
         saw_identity: None,
@@ -207,25 +225,29 @@ pub fn probe(dep: &mut impl Dependency) -> Probe {
     }
 
     eprintln!(
-        "railgun_module: web-dependency probe [{TARGET}]: {} (thread={} caller-kind={:?} caller-identity={:?})",
+        "railgun_module: web-dependency probe [{TARGET}]: {} (dispatch-thread={} load-thread={:?} \
+         left-the-load-thread={:?} caller-kind={:?} caller-identity={:?})",
         if out.ok() { "REACHED IT, CORRECTLY NAMED" } else { "DID NOT" },
-        out.thread,
+        out.dispatch_thread,
+        out.load_thread,
+        out.dispatch_left_the_load_thread(),
         out.saw_kind,
         out.saw_identity
     );
     out
 }
 
-/// The thread the probe is running on, named if it has a name and identified
-/// if it has not. `BareModuleGlue` names its worker `logos-inproc-<module>`, so
-/// a named answer here is itself the evidence that the dispatch left the
-/// delivering thread.
-fn thread_name() -> String {
-    let t = std::thread::current();
-    match t.name() {
-        Some(name) => format!("{name} {:?}", t.id()),
-        None => format!("{:?}", t.id()),
-    }
+/// The calling thread, as something two calls in the same image can be
+/// compared by. Public so that whatever loads this image can record the loading
+/// thread the same way — the comparison is the measurement, and it is only
+/// meaningful between two values produced by this function.
+///
+/// NOT an OS thread id and not a name: `std::thread::ThreadId` is a counter
+/// handed out per image on first use, and a thread the host started carries no
+/// Rust-visible name. A reader who takes `ThreadId(1)` for "the main thread"
+/// would be reading a fact about which thread asked first.
+pub fn thread_id() -> String {
+    format!("{:?}", std::thread::current().id())
 }
 
 #[cfg(test)]
@@ -272,7 +294,7 @@ mod tests {
     #[test]
     fn a_dependency_that_answers_and_names_this_module_is_ok() {
         let mut dep = Fake::answering(THIS_MODULE);
-        let p = probe(&mut dep);
+        let p = probe(&mut dep, None);
         assert!(p.ok(), "{p:?}");
         assert_eq!(p.saw_kind.as_deref(), Some("module"));
         assert_eq!(p.saw_identity.as_deref(), Some(THIS_MODULE));
@@ -283,7 +305,7 @@ mod tests {
     #[test]
     fn the_probe_crosses_three_times_identity_read_identity() {
         let mut dep = Fake::answering(THIS_MODULE);
-        let p = probe(&mut dep);
+        let p = probe(&mut dep, None);
         assert_eq!(dep.seen, LEGS.to_vec());
         assert_eq!(p.legs.len(), LEGS.len());
         assert_eq!(p.target, TARGET);
@@ -296,7 +318,7 @@ mod tests {
     #[test]
     fn a_dependency_that_names_itself_is_not_ok() {
         let mut dep = Fake::answering(TARGET);
-        let p = probe(&mut dep);
+        let p = probe(&mut dep, None);
         assert!(!p.ok(), "a self-named caller must not read as a pass");
         assert!(!p.identity_is_this_module());
         assert_eq!(p.saw_identity.as_deref(), Some(TARGET));
@@ -310,7 +332,7 @@ mod tests {
     fn a_leg_that_fails_is_named_and_the_rest_still_run() {
         let mut dep = Fake::answering(THIS_MODULE);
         dep.accounts = Err("not authorized".to_string());
-        let p = probe(&mut dep);
+        let p = probe(&mut dep, None);
         assert!(!p.ok());
         assert_eq!(p.legs.len(), LEGS.len());
         assert!(p.legs[0].ok());
@@ -320,12 +342,42 @@ mod tests {
         assert!(p.legs[2].ok(), "a failed leg must not end the probe");
     }
 
-    // The blocking question is a thread question, so the thread is reported.
+    // The blocking question is a thread question, so the dispatch thread is
+    // reported — and on its own it settles nothing, which is why the load
+    // thread is reported beside it.
     #[test]
     fn the_probe_names_the_thread_it_ran_on() {
         let mut dep = Fake::answering(THIS_MODULE);
-        let p = probe(&mut dep);
-        assert!(!p.thread.is_empty(), "no thread recorded");
+        let p = probe(&mut dep, None);
+        assert!(!p.dispatch_thread.is_empty(), "no dispatch thread recorded");
+        assert_eq!(p.load_thread, None);
+        assert_eq!(
+            p.dispatch_left_the_load_thread(),
+            None,
+            "an unrecorded load thread is not the same answer as a shared one"
+        );
+    }
+
+    // The arrangement that keeps a `single` module off the delivering thread is
+    // BareModuleGlue's worker, so the probe compares the thread it dispatched
+    // on against the thread the image was loaded on.
+    #[test]
+    fn a_dispatch_on_another_thread_is_reported_as_having_left_the_load_thread() {
+        let mut dep = Fake::answering(THIS_MODULE);
+        let elsewhere = std::thread::spawn(|| thread_id()).join().unwrap();
+        let p = probe(&mut dep, Some(elsewhere));
+        assert_eq!(p.dispatch_left_the_load_thread(), Some(true));
+        assert!(p.ok(), "the thread arrangement is observed, never a criterion");
+    }
+
+    // ...and a dispatch that did NOT leave it is reported as that, rather than
+    // being quietly folded into the pass.
+    #[test]
+    fn a_dispatch_on_the_load_thread_is_reported_as_not_having_left_it() {
+        let mut dep = Fake::answering(THIS_MODULE);
+        let p = probe(&mut dep, Some(thread_id()));
+        assert_eq!(p.dispatch_left_the_load_thread(), Some(false));
+        assert!(p.ok(), "it answered; where it ran is a separate finding");
     }
 
     // `caller_identity` answers a String over the bus, and a transport may hand
@@ -338,7 +390,7 @@ mod tests {
             &format!(r#"{{"ok":true,"kind":"module","identity":"{THIS_MODULE}"}}"#),
         )
         .unwrap()));
-        let p = probe(&mut dep);
+        let p = probe(&mut dep, None);
         assert_eq!(p.saw_identity.as_deref(), Some(THIS_MODULE));
         assert!(p.ok(), "{p:?}");
     }
@@ -349,7 +401,7 @@ mod tests {
     fn an_unreadable_identity_reply_is_not_a_pass() {
         let mut dep = Fake::answering(THIS_MODULE);
         dep.identity_answer = Some(Ok("not json at all".to_string()));
-        let p = probe(&mut dep);
+        let p = probe(&mut dep, None);
         assert_eq!(p.saw_identity, None);
         assert_eq!(p.saw_kind, None);
         assert!(!p.ok());

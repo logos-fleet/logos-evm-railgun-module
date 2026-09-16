@@ -179,7 +179,7 @@ does (#188) — in which case there is no reply at all. Each stage is therefore
 also printed on stderr before it is entered, so a device console still names the
 stage the silence began in.
 
-### `web_dependency_probe() → { ok, target, thread, callerKind, callerIdentity, callerIsThisModule, legs }`
+### `web_dependency_probe() → { ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread, callerKind, callerIdentity, callerIsThisModule, legs }`
 **Can this module reach its `web` dependency from a handset?** On a phone
 `keystore_module` is a `web` (wasm) variant — a page in the Shell's container —
 while this module is native, Bare, cross-compiled and in-process. ADR 0010
@@ -200,11 +200,21 @@ Three ordinary crossings to `keystore_module`, in this order, each timed:
 `railgun_module`: a crossing that arrives under the wrong name admits nobody
 through a name-gated method, which is exactly what a `web` module did to every
 caller before logos-workspace#129 (fixed there in the `web` → `web` direction;
-this is the native → `web` one). `thread` names the thread the dispatch ran on —
-`BareModuleGlue` marshals every dispatch onto its own `logos-inproc-<module>`
-worker while a page answers on the host's Qt main thread, so the thread that
-waits here must not be the thread that has to deliver. A leg that fails does not
-end the probe. Needs no chain, no keys and no engine; safe to call before `init`.
+this is the native → `web` one).
+
+A page answers on the host's Qt main thread, so a module that waited for it on
+that thread would be waiting on the thread that has to deliver. What prevents it
+is `BareModuleGlue`, which dispatches an in-process module on a worker of its
+own rather than on the thread the call arrived on — and `dispatchThread` /
+`loadThread` are that arrangement asked rather than assumed: the image is loaded
+on the host's delivering thread, so the two DIFFERING is the evidence.
+`dispatchLeftTheLoadThread` is the comparison, and `null` (load thread not
+recorded) is not the same answer as `false`. Neither value is an OS thread id —
+`std::thread::ThreadId` is a per-image counter handed out on first use, good for
+comparing two threads of this image and worthless for anything else.
+
+A leg that fails does not end the probe. Needs no chain, no keys and no engine;
+safe to call before `init`.
 
 The calls go through a raw `PluginProxy` rather than `modules().keystore_module`,
 and the two are the same call — a LIDL-generated wrapper for a `String`-returning
