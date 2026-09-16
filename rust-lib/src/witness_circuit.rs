@@ -15,6 +15,13 @@
 //! `ark_circom::WitnessCalculator` the engine drives, on every backend in the
 //! image — and reports milliseconds.
 //!
+//! THE ANSWER, on the venue's physical iPad Air (4th generation): **817 ms**
+//! for `railgun/01x02` under `wasmi` (35 ms to compile, 4 ms to instantiate,
+//! 1.2 s to download the artifact once). A button, not a background job. On the
+//! same device and build the JIT does not get that far — it aborts the app at
+//! `instantiate` with `Region("Cannot allocate memory (os error 12)")`, which
+//! `ark-circom` unwraps.
+//!
 //! ## What it is faithful about, and what it is not
 //!
 //! FAITHFUL: the artifact (fetched from the engine's own artifact base, same

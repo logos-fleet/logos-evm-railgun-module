@@ -60,14 +60,19 @@
 //! than assuming a length, so such a reply carries no `alternatives` instead of
 //! carrying a wrong one.
 //!
-//! IT IS NOT THE BACKEND THE ENGINE USES, and this probe cannot make it one.
+//! AND IT IS NOW THE BACKEND THE ENGINE USES THERE — through a build-time
+//! patch, not through this crate's manifest.
 //! `railgun::circuit::witness::calculate_witness` builds its store with
 //! `Store::default()`, which resolves to cranelift for as long as anything in
 //! the graph asks wasmer for `sys-default` — `ark-circom` does, in a
 //! third-party fork this repo consumes, and cargo unions features, so no line
-//! in this crate's manifest can subtract it. Swapping the engine's backend is
-//! a change to `ark-circom` (or a witness hook in `railgun`); what is settled
-//! here is whether that change has a destination.
+//! in this crate's manifest can subtract it, and the engine crate exposes no
+//! store seam (`mod witness` is private). `rust-lib/patch-kohaku-witness-backend.sh`
+//! rewrites that one line in the VENDORED engine source instead, under exactly
+//! the cfg that gates the feature here, so a physical iOS device proves under
+//! `wasmi` and every other target keeps the default. What this probe settles is
+//! that the destination works; [`crate::witness_circuit`] settles what it costs
+//! (817 ms for a `railgun/01x02` witness on the venue's iPad Air 4).
 //!
 //! ORDER IS LOAD-BEARING: the alternatives run BEFORE the default one. A
 //! backend that gets the process killed takes every answer that would have

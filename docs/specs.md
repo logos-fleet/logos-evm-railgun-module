@@ -351,12 +351,12 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
 - **No approval event subscription**: a caller polls `relayed_send_status`. The
   keystore announces decisions on its event plane (`approval_settled`), which this
   module could subscribe to instead of being polled — follow-up.
-- **PROVING DOES NOT WORK ON iOS (#188), measured on a device.** The module
-  builds, loads, and answers on a phone — but `prepare_transfer`,
-  `prepare_unshield` and `relayed_send` all need a Groth16 witness, and
-  `ark-circom` produces one by running the circuit's `.wasm` under `wasmer`'s
-  **cranelift JIT**. iOS does not let a third-party app execute code it wrote
-  itself, and it does not refuse politely: it kills the process.
+- **PROVING ON iOS: the JIT is refused, and the engine is patched off it
+  (#188).** The module builds, loads and answers on a phone — but
+  `prepare_transfer`, `prepare_unshield` and `relayed_send` all need a Groth16
+  witness, and `ark-circom` produces one by running the circuit's `.wasm` under
+  `wasmer`. iOS does not let a third-party app execute code it wrote itself, and
+  it does not refuse politely: it kills the process.
 
   `witness_engine_probe` is the question asked directly — four stages (`engine`
   → `compile` → `instantiate` → `call`) over a wasm module carried in this crate,
@@ -389,13 +389,97 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   **A simulator proves nothing here**: its pages are macOS pages, where RWX is
   allowed, so the JIT runs there exactly as it does on a desktop.
 
-  **The fix is a backend, not a port — and not one this crate can apply.**
-  `railgun::circuit::witness::calculate_witness` builds its store with
-  `Store::default()`, which resolves to cranelift for as long as anything in the
-  graph asks `wasmer` for `sys-default`; `ark-circom` does, in a third-party
-  fork, and cargo unions features. Pointing the witness generator at `wasmi`
-  means changing `ark-circom` (or adding a witness/store hook to `railgun`)
-  upstream. What is settled here is that the destination works on the device.
+  **THE ENGINE IS POINTED AT THE INTERPRETER, in a build-time patch of the
+  vendored engine.** `railgun::circuit::witness::calculate_witness` builds its
+  store with `Store::default()`, which resolves to cranelift for as long as
+  anything in the graph asks `wasmer` for `sys-default`; `ark-circom` does, in a
+  third-party fork, and cargo unions features — so no line in this crate's
+  manifest can subtract it, `mod witness` is private and `Groth16Prover` exposes
+  no store seam. `rust-lib/patch-kohaku-witness-backend.sh` (named by
+  metadata.json's `nix.rust.env.postPatch`, which logos-module-builder passes to
+  every leg including the mobile cross archives) rewrites that one line:
+
+  ```rust
+  #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+  let mut store = { let s = Store::new(wasmer::wasmi::Wasmi::new()); … };
+  #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
+  let mut store = { let s = Store::default(); … };
+  ```
+
+  The cfg is character-for-character the one that gates the `wasmi` FEATURE in
+  `rust-lib/Cargo.toml` (inverted), because asking for `wasmer::wasmi` where the
+  feature is off would not compile — and because **Android runs the JIT** (#202,
+  measured below), so only the platform that refuses one is diverted. The script
+  asserts the crate, the file, exactly one anchor line and the cfg in the result,
+  so a kohaku bump stops the build naming the script rather than shipping an
+  image that dies on a phone. Each branch prints its own distinct line, so
+  `strings` over the built iOS Bare framework says which one an image carries
+  without running it.
+
+  **AND THE INTERPRETER IS SLOW — this is the part that decides a product
+  question.** `witness_circuit_probe` times the REAL circuit
+  (`railgun/01x02`, 891 KB brotli → 3 MB of wasm) through the engine's own
+  `ark_circom::WitnessCalculator`, on every backend in the image.
+
+  A DESKTOP CALIBRATION FIRST, from `cargo test -- --ignored` on aarch64-darwin
+  (`the_real_circuit_generates_a_witness_on_every_backend`):
+
+  | backend | compile | witness | witness |
+  |---|---|---|---|
+  | `wasmi` (what iOS gets) | 292 ms | 14 206 ms | 10 190 signals, 9 290 non-zero |
+  | `cranelift` (everything else) | 4 259 ms | 229 ms | 10 190 signals, 9 290 non-zero |
+
+  Both backends produce the same witness length from the same artifact, so that
+  is one circuit measured twice. **Read the ratio, not the numbers**: a
+  `cargo test` build is the dev profile, and an interpreter is host Rust code
+  while a JIT's output is not — so `wasmi` is penalised by the profile and
+  cranelift's 229 ms is not. The shipped image is `--release`, which is what the
+  device figure below is.
+
+  THE DEVICE FIGURE — physical iPad Air (4th generation), iOS 26.5.2, the
+  shipped release build, `--call
+  railgun_module.witness_circuit_probe(str:{"backends":["wasmi"]})`:
+
+  ```
+  railgun_module: witness-circuit probe [wasmi] 01x02: GENERATED A WITNESS
+    (backend=wasmi reached=witness compile=Some(35)ms instantiate=Some(4)ms
+     witness=Some(817)ms len=Some(10190) nonzero=Some(9290) error=None)
+  [shell] CALL OK railgun_module.witness_circuit_probe(...) ->
+    {"circuit":"01x02","downloadMs":1167,"wasmBytes":3007613,"ok":true,
+     "sanityCheck":false,"probes":[{"backend":"wasmi","compileMs":35,
+     "instantiateMs":4,"witnessMs":817,"witnessLen":10190,
+     "witnessNonzero":9290,"reached":"witness","error":null,"signals":[…]}]}
+  ```
+
+  **817 ms for a transact witness on an A14 iPad**, over the real circuit, with
+  every one of the 14 signals' sizes confirmed by the circuit itself and the
+  same 10 190-signal / 9 290-non-zero witness a desktop produces. Download
+  (1.2 s, cacheable) and compile (35 ms) are beside it, not inside it. The
+  interpreter is not the problem anyone expected it to be: this is the "ship
+  it" end of the scale, not the "needs a background job" end — a private send's
+  cost is dominated by the Groth16 proof after it, which is not measured here.
+
+  TWO THINGS THE NUMBER DOES NOT SAY. The engine calls `calculate_witness` with
+  circom's sanity check ON, and this probe must turn it off (its placeholder
+  inputs are exactly what those assertions reject), so the real call adds the
+  circuit's assertion checks on top. And a witness is not a proof: `prove_transact`
+  then runs Groth16 over it with arkworks.
+
+  AND THE JIT STILL DIES THERE, on the same device and the same build — now at
+  a different stage, because a 3 MB circuit needs a real code region rather than
+  a page:
+
+  ```
+  railgun_module: witness-circuit probe [engine-default] 01x02: entering instantiate
+  thread '<unnamed>' panicked at .../ark-circom-0.6.0/src/witness/witness_calculator.rs:63:77:
+  called `Result::unwrap()` on an `Err` value: Region("Cannot allocate memory (os error 12)")
+  fatal runtime error: failed to initiate panic, error 5, aborting
+  App terminated due to signal 6.
+  ```
+
+  `ark-circom` unwraps that `Err`, so an unpatched image does not fail the call —
+  it takes the app down. Which is the whole argument for choosing the backend
+  rather than defaulting it.
 
   Unaffected: `init` / `init_from_seed` / `get_zk_address` / `sync` /
   `get_shielded_balance` / `prepare_shield` — the shield path builds unsigned

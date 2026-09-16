@@ -102,8 +102,11 @@
       #
       # AND THE COST OF THE INTERPRETER IS MEASURED, not assumed:
       # `witness_circuit_probe` times the REAL circuit through the engine's own
-      # calculator on each backend in the image. See docs/specs.md for both
-      # numbers and for what the probe's placeholder inputs do and do not
+      # calculator on each backend in the image. On the venue's physical iPad
+      # Air (4th gen) a `railgun/01x02` witness takes 817 ms under `wasmi`,
+      # while the JIT path aborts the app at `instantiate` ("Cannot allocate
+      # memory (os error 12)", which ark-circom unwraps). See docs/specs.md for
+      # both numbers and for what the probe's placeholder inputs do and do not
       # prove.
       #
       # `? ${t}` rather than a bare index, so a logos-module-builder pin without
