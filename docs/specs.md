@@ -504,6 +504,114 @@ LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
   `no configuration for chain 11155111`. `init_defaults()` is idempotent and
   persists, so it is needed on the first launch only.
 
+### `live_send_probe(params_json) → { ok, chainId, eoa, ethWei, tokenUnits, needsFunding, asset, from, to, approveTx, shieldTx, shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
+**The same send with NOTHING substituted: on chain, mined, and accepted by the
+contract** (#213 acceptance clause 1).
+
+`private_send_probe` above fabricates exactly one thing — the `Shield` event —
+and reports the cost of that with `rootOnChain: false`. This probe fabricates
+nothing. It shields real ERC-20 with a real transaction, waits for a block,
+syncs the **real** Sepolia tree, proves over the root the **contract** holds,
+and broadcasts the proved `transact(...)` so the RAILGUN smart wallet itself
+verifies the Groth16 proof the device produced.
+
+| leg | what happens |
+|---|---|
+| `keys` | the probe's own railgun signer + counterparty, from the same fixed seeds `private_send_probe` uses |
+| `funding` | `eth_getBalance` + ERC-20 `balanceOf` for the probe's EOA — the gate, see below |
+| `engine` | `RailgunBuilder::build` over a `MemoryDatabase` and the **default** syncer (subsquid, then RPC): the real chain's events, not a syncer we wrote |
+| `approve` | ERC-20 `approve(RailgunSmartWallet, amount)` — signed, broadcast, waited on. Skipped where the allowance already covers it |
+| `shield` | the ENGINE's own `ShieldBuilder` calldata — signed, broadcast, waited on |
+| `sync` | the engine finds its own note in the contract's tree, beside every other shield ever made on this chain |
+| `balance` | a shielded balance a **transaction** put there |
+| `transfer` | `TransactionBuilder` → circuit inputs → the engine's own `calculate_witness` → `Groth16Prover::prove` **and verify** |
+| `root-on-chain` | `RailgunSmartWallet.rootHistory(tree, root)` — expected **true**, and a `false` here FAILS the leg rather than being reported as a limit |
+| `broadcast` | the proved `transact(...)` sent and mined: the chain's own verdict on the proof |
+
+The tree number is read off the operation the engine built
+(`transaction.boundParams.treeNumber`), not assumed: RAILGUN opens a new tree
+every 65 536 commitments and asking `rootHistory` about the wrong one answers a
+confident `false`.
+
+**A mined revert is a failure.** `wait` treats a receipt with `status: 0x0` as an
+error naming the block — the RPC call succeeded and every field is present, which
+is exactly the shape of answer a probe reports as success by accident.
+
+#### It signs with an EOA of its own, and that key is public
+
+A shield is an ordinary transaction and needs an ordinary signature, and the
+user's account cannot give one to an unattended run: `keystore_module` signs only
+through `request_approval` → a human `approve(handle, bundle_id, password)`,
+which is Tier A **and** takes the vault password. That gate is correct, so the
+probe does not try to get round it — it brings its own key:
+
+```
+secp256k1 secret = keccak256("logos-railgun/#213 live-send probe EOA/v1")
+address          = 0x23cc2752F664Bf465A3631253687712b222B1722
+```
+
+Anybody reading `rust-lib/src/live_send.rs` can rederive and spend that account.
+That is the safety argument rather than a hole in it: it is a measurement
+fixture, so it must never be able to hold anything worth taking. Two guards keep
+it that way — **Sepolia only**, refused before a single chain read (a probe that
+reads mainnet state first has already told a mainnet node the account is
+interesting), and nothing of the module's: its own provider over a
+`MemoryDatabase`, no keystore, no persistence dir, nothing written anywhere.
+
+`chainId` is deliberately not a parameter for the same reason.
+
+#### Until it is funded, a run is a handoff rather than a crash
+
+The `funding` leg stops the run and reports `needsFunding` — the address, what it
+holds, and what it needs — before an engine is built or anything is signed. The
+address is fixed, so funding it is a one-time operator step: **≥ 0.01 Sepolia ETH**
+for gas and **≥ 1 USDC** at `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` (a run
+shields `100000` units = 0.1 USDC, so 1 USDC is ten runs).
+
+`{ "asset"?: "0x…", "shield"?: "100000", "transfer"?: decimal, "memo"?: string,
+"broadcast"?: bool, "confirmMs"?: u64 }` — all optional, so `live_send_probe()`
+is a complete call. `transfer` defaults to **half of whatever the engine reports
+as shielded**, which keeps a change note (and so the `01x02` circuit the other
+two probes measured) whatever the RAILGUN shield fee took.
+
+**The real sync is the leg with nothing to fall back on**, and it is measured:
+`the_engine_syncs_the_real_sepolia_tree` (an `#[ignore]`d test needing no funds)
+builds the engine and syncs the whole Sepolia UTXO tree — **31.2 s** on
+aarch64-darwin, dev profile, against a public RPC.
+
+**And the signature is checked by a node rather than by the library that made
+it.** `sign_1559` can only prove to itself that its output recovers to the right
+address, so `a_real_node_refuses_the_probes_transaction_for_funds_not_for_its_sender`
+submits a real signed transaction from the empty EOA and asserts on WHICH
+refusal comes back — a transaction whose signature does not recover is refused
+for its *sender*, one that is merely unaffordable is refused for *funds*:
+
+```
+{"code":-32003,"message":"insufficient funds for gas * price + value:
+                          have 0 want 46257038142001"}
+```
+
+So the encoding, the EIP-1559 envelope and the ECDSA recovery are all confirmed
+by Sepolia itself; only the balance is missing. (That figure is also the going
+rate: ~0.000046 ETH for a 21 000-gas transfer, so 0.01 ETH is a great many runs.)
+
+```bash
+# on the host, the whole thing (spends testnet funds, waits on blocks)
+cargo test --features engine_seam -- --ignored --nocapture the_whole_send
+
+# on a device
+LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
+  ws run logos-basecamp --target ios-arm64 --app shell \
+     --bundle railgun_module,capability_module \
+     --local logos-evm-railgun-module \
+     -- --call 'eth_rpc_module.init_defaults()' \
+        --call 'railgun_module.live_send_probe(str:{})'
+```
+
+The same two Bundled-set requirements as `private_send_probe` apply —
+`capability_module` in the set, and one `eth_rpc_module.init_defaults()` on a
+device that has never run the wallet.
+
 ### `web_dependency_probe() → { ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread, callerKind, callerIdentity, callerIsThisModule, legs }`
 **Can this module reach its `web` dependency from a handset?** On a phone
 `keystore_module` is a `web` (wasm) variant — a page in the Shell's container —

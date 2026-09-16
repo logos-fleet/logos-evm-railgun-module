@@ -19,7 +19,19 @@ eip-1193-provider = { git = "https://github.com/ethereum/kohaku" }
 userop-kit = { git = "https://github.com/ethereum/kohaku" }
 
 # `signers` re-exports the `Signer` trait we implement for the keystore bridge.
-alloy = { version = "1.8", default-features = false, features = ["signers"] }
+#
+# `consensus` + `eips` are #213's: `live_send` SIGNS AND BROADCASTS the shield
+# and the proved `transact(...)`, which needs a transaction type
+# (`alloy::consensus::TxEip1559`), its signing hash and its 2718 envelope
+# encoding. Both crates are already in this lock as the facade's own optional
+# deps (`alloy-consensus`, `alloy-eips`, `alloy-rlp`), so these two words add a
+# module path and not a package — the vendor directory is unchanged. The secp256k1
+# key itself needs nothing new: `alloy::signers` already re-exports `k256`.
+alloy = { version = "1.8", default-features = false, features = [
+  "signers",
+  "consensus",
+  "eips",
+] }
 # `reqwest::Url` is the bundler-URL type PimlicoBundler::new takes; the `url`
 # crate is its re-export — one version in the tree unifies the types.
 url = "2"
