@@ -43,6 +43,16 @@
 //! here" is "and this is what works instead", measured on the same device in
 //! the same process rather than hoped for in a follow-up.
 //!
+//! EXCEPT ON ANDROID, WHERE IT IS NOT IN THE IMAGE AT ALL (#202). `wasmi` is a
+//! `cfg(not(target_os = "android"))` dependency because wasmer's build script
+//! cannot generate its C-API bindings against the NDK sysroot — see the note on
+//! that section in `rust-lib/Cargo.toml` for the failure and the one condition
+//! for putting it back. It costs this probe nothing it was asked for: the
+//! permission question is iOS's, Android executes emitted code freely, and
+//! [`PROBE_ORDER`] there is simply the engine's own backend on its own. Every
+//! consumer reads the order rather than assuming a length, so an Android reply
+//! carries no `alternatives` instead of carrying a wrong one.
+//!
 //! IT IS NOT THE BACKEND THE ENGINE USES, and this probe cannot make it one.
 //! `railgun::circuit::witness::calculate_witness` builds its store with
 //! `Store::default()`, which resolves to cranelift for as long as anything in
@@ -122,6 +132,9 @@ pub enum Backend {
     /// page for a platform to refuse. Present here to be MEASURED, not used:
     /// see this module's docs for why the engine cannot be pointed at it from
     /// this crate.
+    ///
+    /// Absent on Android, where the backend is not in the image (#202).
+    #[cfg(not(target_os = "android"))]
     Wasmi,
 }
 
@@ -132,6 +145,7 @@ impl Backend {
     pub fn requested(self) -> &'static str {
         match self {
             Backend::EngineDefault => "engine-default",
+            #[cfg(not(target_os = "android"))]
             Backend::Wasmi => "wasmi",
         }
     }
@@ -139,6 +153,7 @@ impl Backend {
     fn store(self) -> Store {
         match self {
             Backend::EngineDefault => Store::default(),
+            #[cfg(not(target_os = "android"))]
             Backend::Wasmi => Store::new(wasmer::wasmi::Wasmi::new()),
         }
     }
@@ -147,7 +162,17 @@ impl Backend {
 /// Every backend [`probe_all`] measures, in the order it measures them. The
 /// engine's own is LAST: a backend the platform kills the process over ends
 /// the run, and an answer that never arrives is worth less than one that does.
-pub const PROBE_ORDER: [Backend; 2] = [Backend::Wasmi, Backend::EngineDefault];
+///
+/// A slice rather than a fixed-size array because the set is not the same
+/// everywhere: Android has no `wasmi` in its image (#202), so there the order is
+/// one entry long and `probe_all` answers about the engine's backend alone.
+#[cfg(not(target_os = "android"))]
+pub const PROBE_ORDER: &[Backend] = &[Backend::Wasmi, Backend::EngineDefault];
+
+/// Android's: the engine's own backend, and nothing beside it. See
+/// [`Backend::Wasmi`].
+#[cfg(target_os = "android")]
+pub const PROBE_ORDER: &[Backend] = &[Backend::EngineDefault];
 
 /// What the probe found.
 #[derive(Debug, Clone)]
@@ -320,6 +345,10 @@ mod tests {
     // THE WAY OUT IS REAL CODE, not a plan: the interpreter is in this image
     // and it runs the same wasm to the same answer. A device where the default
     // backend is killed and this one is not is the whole argument for the swap.
+    //
+    // This runs on a desktop, which is never Android — the cfg is what keeps it
+    // compiling if these tests are ever built for one (#202).
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn the_interpreter_backend_runs_the_same_wasm() {
         let p = probe_backend(Backend::Wasmi);
@@ -339,6 +368,7 @@ mod tests {
     #[test]
     fn the_engines_own_backend_is_probed_last() {
         assert_eq!(*PROBE_ORDER.last().unwrap(), Backend::EngineDefault);
+        assert!(!PROBE_ORDER.is_empty());
         let all = probe_all();
         assert_eq!(all.len(), PROBE_ORDER.len());
         assert_eq!(all.last().unwrap().requested, "engine-default");

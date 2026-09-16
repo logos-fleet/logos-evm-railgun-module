@@ -173,6 +173,13 @@ interpreter), so a device that refuses the JIT also says what would work instead
 Needs no chain, no keys, no artifact download and no shielded balance; safe to
 call before `init`.
 
+**On Android `alternatives` is empty**, and that is the image rather than the
+probe: `wasmi` is a `cfg(not(target_os = "android"))` dependency because wasmer's
+build script cannot generate its C-API bindings against the NDK sysroot (#202 —
+see `rust-lib/Cargo.toml`). Nothing is lost by it: the permission question the
+alternative answers is iOS's, and Android executes emitted code freely. The
+headline (`ok`, `backend`, `reached`) is the same measurement everywhere.
+
 A platform may refuse by killing the process rather than returning an error — iOS
 does (#188) — in which case there is no reply at all. Each stage is therefore
 also printed on stderr before it is entered, so a device console still names the
@@ -269,6 +276,41 @@ stage the silence began in.
   Unaffected: `init` / `init_from_seed` / `get_zk_address` / `sync` /
   `get_shielded_balance` / `prepare_shield` — the shield path builds unsigned
   calldata and needs no proof. Android has no such restriction (unmeasured).
+
+- **The Android Bare build is a check now (#202).** Adding the `wasmi` feature
+  above for the iOS measurement broke the `aarch64-android` cross outright —
+  wasmer's build script runs bindgen for the `wasmi` C API, and in a Logos
+  Android cross build bindgen gets `--target aarch64-linux-android` with the
+  build platform's nix libcxx headers and no NDK sysroot:
+
+  ```
+  .../libcxx-19.1.7-dev/include/c++/v1/__configuration/platform.h:35:12:
+      fatal error: 'features.h' file not found
+  panicked at wasmer-6.1.0/build.rs:422: Unable to generate bindings for `wasmi`!
+  ```
+
+  It was invisible for as long as nobody asked a phone for anything — #148
+  verified all three mobile targets by hand, #188 measured on iOS, and no check
+  compiled the Android cross — and it surfaced five derivations away, as
+  `catalog-logos-basecamp-mobile-dev` refusing to evaluate. Since this module is
+  a mobile catalog member, that took down *every* Android Bundled set whose
+  closure touches it, not only one that names it.
+
+  Two things came out of it. `wasmi` is asked for only where its bindgen works
+  (`[target.'cfg(not(target_os = "android"))'.dependencies]`, which keeps it on
+  iOS and on a desktop and is exactly the old feature set there), and the flake
+  now exposes `checks.<build-system>.android-bare` — the real Bare artifact, not
+  a `cargo check`, because the failure was in a dependency's build script and
+  the Android DT_NEEDED gate is worth running too. It needs no device:
+
+  ```
+  nix build <workspace>#checks.aarch64-darwin.logos-evm-railgun-module--android-bare
+  ws test logos-evm-railgun-module --local logos-evm-railgun-module
+  ```
+
+  The check is empty under this repo's *own* `flake.lock`, whose published
+  logos-module-builder has no mobile cross sets; it is real for every consumer
+  that supplies a builder which does.
 
 - **No `web` (wasm) variant, and not for a reason in this repo (#168).** The flake
   withholds `packages.<system>.web`. What blocks it, measured rather than assumed:

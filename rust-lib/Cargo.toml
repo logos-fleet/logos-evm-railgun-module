@@ -29,11 +29,7 @@ url = "2"
 # one crate with one feature set and `witness_engine` measures the SAME backend
 # the engine proves with (#188). If this drifted from ark-circom's request the
 # probe would measure a backend the engine does not use.
-# `"wasmi"` is ADDITIVE and changes nothing about that: `BackendKind::default()`
-# still answers cranelift while `sys-default` is in the set. It puts the pure-Rust
-# interpreter in the image so the probe can measure the way OUT of the JIT on the
-# same device, in the same process.
-wasmer = { version = "6.1", default-features = false, features = ["default", "wasmi"] }
+wasmer = { version = "6.1", default-features = false, features = ["default"] }
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +42,38 @@ tokio = { version = "1", features = ["rt", "time", "net", "io-util", "macros"] }
 
 # Provided by logos-module-builder at build time (staged into ../logos-rust-sdk-src).
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+# ── the interpreter backend, EVERYWHERE THE BINDGEN WORKS ─────────────────────
+# `"wasmi"` is ADDITIVE to the line above and changes nothing about the backend
+# the engine proves with: `BackendKind::default()` still answers cranelift while
+# `sys-default` is in the set. It puts wasmer's pure-Rust interpreter in the
+# image so `witness_engine` can measure the way OUT of the JIT on the same
+# device, in the same process (#188) — the measurement that found iOS kills the
+# process at the JIT's first emitted call.
+#
+# AND IT IS NOT ASKED FOR ON ANDROID (#202). wasmer's build script generates the
+# `wasmi` C-API bindings with bindgen, and in a Logos Android cross build bindgen
+# is handed `--target aarch64-linux-android` with the BUILD platform's nix
+# libcxx headers and no NDK sysroot, so libcxx's `platform.h` reaches for a
+# `features.h` that is not on the include path:
+#
+#   Unable to generate bindings for `wasmi`!: ClangDiagnostic(... 'features.h' file not found)
+#
+# That took the whole Android Bare build down, and with it EVERY Android Bundled
+# set whose closure touches this module's catalog entry — this module is in the
+# mobile catalog, so "whose closure touches it" is not only "which names it".
+# Android has no JIT restriction and never needed the interpreter: the measured
+# question belongs to iOS. `cfg(not(target_os = "android"))` rather than a bare
+# `cfg(target_os = "ios")` because a desktop is where the probe's own positive
+# control runs (`witness_engine`'s tests compare the two backends on a platform
+# that allows RWX), and that control is what makes a handset's answer mean
+# anything.
+#
+# Cargo UNIONS features across these sections, so this is exactly the old line
+# on every target but one. The day bindgen is given the NDK sysroot, delete the
+# section and put `"wasmi"` back beside `"default"`.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+wasmer = { version = "6.1", default-features = false, features = ["wasmi"] }
 
 [features]
 default = ["logos_module"]
