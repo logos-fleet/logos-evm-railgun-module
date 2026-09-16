@@ -69,6 +69,22 @@
 //! Until the ETH lands every run stops at the `funding` leg and reports the ask,
 //! which is a complete handoff rather than a failure: the address is fixed, so
 //! the funding is a one-time step and every later run is unattended.
+//!
+//! ## And every leg can be RUN today, against a fork, with no operator at all
+//!
+//! `anvil --fork-url <sepolia>` serves the real Sepolia state — the same
+//! `RailgunSmartWallet` bytecode at the same address, the same WETH, the whole
+//! historical accumulator — from a node that will also credit an account on
+//! request. Point the acceptance test's RPC at it (`LOGOS_SEPOLIA_RPC`),
+//! `anvil_setBalance` this EOA, and `the_whole_send_lands_on_chain` shields,
+//! mines, syncs, proves, checks `rootHistory` and broadcasts, end to end and
+//! repeatably. docs/specs.md has the recipe and the measured run.
+//!
+//! That is not the same evidence as a public-chain run and it must not read like
+//! one, so every [`Run`] carries [`Run::node`] (`web3_clientVersion`, verbatim)
+//! and [`Run::forked`]: a fork and Sepolia agree about the chain id, the
+//! contracts, the tree and `rootOnChain`, and the client version is the only
+//! thing that tells them apart.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -135,6 +151,16 @@ pub const DEFAULT_WRAP_SHIELD: u128 = 100_000_000_000_000;
 /// and a `transact` ~1.5 M, so at Sepolia's usual few gwei this is generous.
 pub const MIN_GAS_WEI: u128 = 5_000_000_000_000_000; // 0.005 ETH
 
+/// Client versions that mean "a chain running on this desk". A fork answers
+/// every question Sepolia answers — same chain id, same contract bytecode, same
+/// historical tree — so a run against one is real in every respect except that
+/// its funds were conjured, and the report must not read like a public-chain
+/// one. Matched on the client name, which is the part a node does not vary.
+pub fn is_local_fork(client_version: &str) -> bool {
+    let v = client_version.to_ascii_lowercase();
+    ["anvil", "hardhat", "ganache", "ethereumjs", "foundry"].iter().any(|n| v.contains(n))
+}
+
 /// The probe's secp256k1 key. Deterministic, and derivable by anybody.
 pub fn probe_eoa_key() -> SigningKey {
     let material = keccak256(PROBE_EOA_SEED);
@@ -193,6 +219,14 @@ impl Default for Params {
 #[derive(Debug, Clone, Default)]
 pub struct Run {
     pub chain_id: u64,
+    /// WHOSE CHAIN ANSWERED — `web3_clientVersion`, verbatim, read before
+    /// anything is spent. A fork of Sepolia and Sepolia itself agree on the
+    /// chain id, the contracts, the tree and `rootOnChain`, so this is the only
+    /// field that tells the two apart. `None` where the node would not say.
+    pub node: Option<String>,
+    /// The node named itself a local development chain, so this run is against
+    /// a FORK and not the public chain — see [`is_local_fork`].
+    pub forked: bool,
     pub legs: Vec<Leg>,
     /// The EOA that pays and shields. Always reported, even by a run that stops
     /// at `funding`, because it IS the handoff.
@@ -552,6 +586,15 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     let eoa = Eoa::new(backend.clone(), p.chain_id);
     out.eoa = Some(eoa.address.to_string());
 
+    // Whose chain this is. Asked first and never fatal: a node that will not
+    // name itself leaves `node: None` rather than stopping a run, because the
+    // identity is EVIDENCE and the send is the measurement.
+    out.node = backend
+        .rpc("web3_clientVersion", json!([]))
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string));
+    out.forked = out.node.as_deref().is_some_and(is_local_fork);
+
     // ── the two railgun parties ────────────────────────────────────────────
     entering("keys");
     let binding = ChainId::evm(p.chain_id);
@@ -881,12 +924,15 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
 pub fn report(r: &Run) {
     let leg = |n: &str| r.leg(n).and_then(|l| l.ms);
     eprintln!(
-        "railgun_module: live-send probe: {} (chain={} eoa={:?} circuit={:?} shielded={:?} \
-         transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} shieldTx={:?} \
-         transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms approve={:?}ms \
-         shield={:?}ms sync={:?}ms balance={:?}ms transfer={:?}ms broadcast={:?}ms total={}ms)",
+        "railgun_module: live-send probe: {} (chain={} node={:?}{} eoa={:?} circuit={:?} \
+         shielded={:?} transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} \
+         shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
+         approve={:?}ms shield={:?}ms sync={:?}ms balance={:?}ms transfer={:?}ms \
+         broadcast={:?}ms total={}ms)",
         if r.ok() { "SENT" } else { "DID NOT" },
         r.chain_id,
+        r.node,
+        if r.forked { " FORK-NOT-PUBLIC-SEPOLIA" } else { "" },
         r.eoa,
         r.circuit,
         r.balance,
@@ -1049,6 +1095,47 @@ mod tests {
             "it went past the funding check"
         );
         assert!(!chain.asked().iter().any(|m| m == "eth_sendRawTransaction"));
+    }
+
+    // WHICH NODE ANSWERED. A run against a FORK of Sepolia and a run against
+    // public Sepolia produce byte-identical console lines otherwise — same chain
+    // id, same contracts, same tree, same `rootOnChain: true` — and the two are
+    // not the same evidence. #213 clause 1 is about a shield mined on the public
+    // chain, so the report has to name its node rather than leave the
+    // distinction in a human's memory: `anvil/v1.8.1` is a fork, `erigon/…` or
+    // `Nethermind/…` is not.
+    #[test]
+    fn the_run_names_the_node_that_answered() {
+        let chain = Canned::with(&[
+            ("web3_clientVersion", json!("anvil/v1.8.1")),
+            ("eth_getBalance", json!("0x0")),
+            ("eth_call", word(0)),
+        ]);
+        let out = block_on(run(chain, Params::default()));
+        assert_eq!(
+            out.node.as_deref(),
+            Some("anvil/v1.8.1"),
+            "a run that stops at funding must still say whose chain it read"
+        );
+        assert!(
+            out.forked,
+            "an anvil client version is a local fork and the run must say so"
+        );
+    }
+
+    // A node that does not answer `web3_clientVersion` is NOT a failed run: the
+    // identity is evidence, not a dependency, and a proxy may refuse the method.
+    // The run reports `node: None` and carries on to the leg that matters.
+    #[test]
+    fn a_node_that_will_not_name_itself_does_not_stop_the_run() {
+        let chain = Canned::with(&[
+            ("eth_getBalance", json!("0x0")),
+            ("eth_call", word(0)),
+        ]);
+        let out = block_on(run(chain, Params::default()));
+        assert_eq!(out.node, None);
+        assert!(!out.forked, "an unknown node is not a fork, it is unknown");
+        assert!(out.needs_funding.is_some(), "it stopped before the funding leg: {out:?}");
     }
 
     // ── the funding decision, which is the whole of the operator ask ───────
