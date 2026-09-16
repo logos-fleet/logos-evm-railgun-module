@@ -314,7 +314,7 @@ pub fn run(circuit: &str, backends: &[Backend], wasm: &[u8], url: String, downlo
 /// One backend, announced and reported as it happens — an earlier backend's
 /// number survives a later one's death.
 pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
-    let (p, _) = measure(which, circuit, shape, wasm);
+    let (p, _) = measure_witness(which, circuit, shape, wasm);
     eprintln!(
         "railgun_module: witness-circuit probe [{}] {circuit}: {} (backend={} reached={} \
          compile={:?}ms instantiate={:?}ms witness={:?}ms len={:?} nonzero={:?} error={:?})",
@@ -332,22 +332,16 @@ pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -
     p
 }
 
-/// One backend's run WITH the witness itself, for a caller that needs the
-/// values rather than a measurement — [`crate::proof_circuit`] proves over
-/// them. [`probe_backend`] is this with the values dropped, so the two can
-/// never measure different runs.
+/// The stages themselves, silent about the outcome: [`probe_backend`] is what
+/// reports it, and is this with the witness dropped — so a caller that needs
+/// the VALUES ([`crate::proof_circuit`] proves over them) and a caller that
+/// needs the measurement can never be reading two different runs.
 pub fn measure_witness(
     which: Backend,
     circuit: &str,
     shape: Shape,
     wasm: &[u8],
 ) -> (Probe, Option<Vec<BigInt>>) {
-    measure(which, circuit, shape, wasm)
-}
-
-/// The stages themselves, silent about the outcome: [`probe_backend`] is what
-/// reports it.
-fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> (Probe, Option<Vec<BigInt>>) {
     entering(which, circuit, stage::ENGINE);
     let mut store = which.store();
     let mut out = Probe {

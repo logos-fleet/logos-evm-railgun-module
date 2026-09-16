@@ -154,6 +154,22 @@ pub struct Leg {
 }
 
 impl Leg {
+    /// A step that completed and moved nothing over the network.
+    fn timed(name: &'static str, ms: Option<u128>) -> Leg {
+        Leg { name, ms, bytes: None, error: None }
+    }
+
+    /// A download, with the compressed size it moved.
+    fn downloaded(name: &'static str, ms: u128, bytes: usize) -> Leg {
+        Leg { name, ms: Some(ms), bytes: Some(bytes), error: None }
+    }
+
+    /// A step that did not complete. `ms` is what it spent before failing
+    /// where that is known, so a slow failure is still visible as one.
+    fn failed(name: &'static str, ms: Option<u128>, error: String) -> Leg {
+        Leg { name, ms, bytes: None, error: Some(error) }
+    }
+
     pub fn ok(&self) -> bool {
         self.error.is_none()
     }
@@ -197,6 +213,14 @@ impl Run {
     pub fn leg(&self, name: &str) -> Option<&Leg> {
         self.legs.iter().find(|l| l.name == name)
     }
+
+    /// Stamp the elapsed total and hand the run back. Every exit from [`run`]
+    /// goes through this, so a run that gave up at its first leg still
+    /// reports the time it spent getting there.
+    fn finished(mut self, started: Instant) -> Run {
+        self.total_ms = started.elapsed().as_millis();
+        self
+    }
 }
 
 /// Announce a stage BEFORE entering it, for the reason
@@ -225,24 +249,29 @@ async fn fetch(url: &str) -> Result<(Vec<u8>, usize), String> {
     Ok((out, compressed.len()))
 }
 
-/// `RemoteArtifactLoader::load_proving_key`, spelled here: fetch, brotli,
-/// `ProvingKey::<Bn254>::deserialize_uncompressed_unchecked`.
-pub async fn load_proving_key(circuit: &str) -> Result<(ProvingKey<Bn254>, usize), String> {
-    let url = artifact_url(circuit, PROVING_KEY_FILE);
+/// One artifact, read the way `RemoteArtifactLoader` reads both of them:
+/// fetch, brotli, `deserialize_uncompressed_unchecked`.
+async fn load_artifact<T: CanonicalDeserialize>(
+    circuit: &str,
+    file: &str,
+) -> Result<(T, usize), String> {
+    let url = artifact_url(circuit, file);
     let (bytes, compressed) = fetch(&url).await?;
-    let pk = ProvingKey::<Bn254>::deserialize_uncompressed_unchecked(Cursor::new(bytes))
+    let value = T::deserialize_uncompressed_unchecked(Cursor::new(bytes))
         .map_err(|e| format!("deserialize {url}: {e}"))?;
-    Ok((pk, compressed))
+    Ok((value, compressed))
+}
+
+/// `RemoteArtifactLoader::load_proving_key`, spelled here.
+pub async fn load_proving_key(circuit: &str) -> Result<(ProvingKey<Bn254>, usize), String> {
+    load_artifact(circuit, PROVING_KEY_FILE).await
 }
 
 /// `RemoteArtifactLoader::load_matrices`, spelled here — through the engine's
 /// OWN `SerializableNpIndex`, which is public, so the wire format is the
 /// engine's rather than a second reading of it.
 pub async fn load_matrices(circuit: &str) -> Result<(NPIndex<Fr>, usize), String> {
-    let url = artifact_url(circuit, MATRICES_FILE);
-    let (bytes, compressed) = fetch(&url).await?;
-    let m = SerializableNpIndex::<Fr>::deserialize_uncompressed_unchecked(Cursor::new(bytes))
-        .map_err(|e| format!("deserialize {url}: {e}"))?;
+    let (m, compressed) = load_artifact::<SerializableNpIndex<Fr>>(circuit, MATRICES_FILE).await?;
     Ok((m.into(), compressed))
 }
 
@@ -258,11 +287,13 @@ pub fn engine_inputs(shape: Shape) -> HashMap<String, Vec<U256>> {
 }
 
 /// A witness as the engine hands it on: `ruint` `U256` → `Fr`, exactly the
-/// conversion `Groth16Prover::prove` makes.
-fn to_field(witness: &[U256]) -> Vec<Fr> {
+/// conversion `Groth16Prover::prove` makes. Takes an iterator because the
+/// replica's witness arrives as `num_bigint` and is converted on the way
+/// through, rather than into a second vector first.
+fn to_field(witness: impl IntoIterator<Item = U256>) -> Vec<Fr> {
     witness
-        .iter()
-        .map(|x| Fr::from(ark_ff::BigInt::from(*x)))
+        .into_iter()
+        .map(|x| Fr::from(ark_ff::BigInt::from(x)))
         .collect()
 }
 
@@ -373,13 +404,22 @@ pub fn witness_len_check(matrices: &NPIndex<Fr>, len: usize) -> Result<(), Strin
     ))
 }
 
+/// What [`prove`] cost, and what it decided. `verified` is expected to be
+/// `false` over placeholder values — see the module docs.
+#[derive(Debug, Clone, Copy)]
+pub struct Proof {
+    pub prove_ms: u128,
+    pub verify_ms: u128,
+    pub verified: bool,
+}
+
 /// `Groth16Prover::prove`'s tail: create the proof over `[a, b]`, then verify
-/// it. Returns the two timings and the verdict.
+/// it.
 pub fn prove(
     pk: &ProvingKey<Bn254>,
     matrices: NPIndex<Fr>,
     witness: &[Fr],
-) -> Result<(u128, u128, bool), String> {
+) -> Result<Proof, String> {
     witness_len_check(&matrices, witness.len())?;
     let num_instance = matrices.num_instance_variables;
     let num_constraints = matrices.num_constraints;
@@ -399,9 +439,10 @@ pub fn prove(
 
     let t = Instant::now();
     let pvk = prepare_verifying_key(&pk.vk);
-    let verified = Groth16::<Bn254, CircomReduction>::verify_proof(&pvk, &proof, &witness[1..num_instance])
-        .map_err(|e| format!("verify: {e}"))?;
-    Ok((prove_ms, t.elapsed().as_millis(), verified))
+    let verified =
+        Groth16::<Bn254, CircomReduction>::verify_proof(&pvk, &proof, &witness[1..num_instance])
+            .map_err(|e| format!("verify: {e}"))?;
+    Ok(Proof { prove_ms, verify_ms: t.elapsed().as_millis(), verified })
 }
 
 /// The whole measurement, in the order a private send pays for it.
@@ -425,8 +466,7 @@ pub async fn run(circuit: &str) -> Run {
         out.error = Some(format!(
             "'{circuit}' is not a transact circuit name (expected NNxMM, e.g. {DEFAULT_CIRCUIT})"
         ));
-        out.total_ms = started.elapsed().as_millis();
-        return out;
+        return out.finished(started);
     };
 
     // ── the artifacts, which is where the user's wait starts ──────────────
@@ -434,18 +474,12 @@ pub async fn run(circuit: &str) -> Run {
     let t = Instant::now();
     let pk = match load_proving_key(circuit).await {
         Ok((pk, bytes)) => {
-            out.legs.push(Leg {
-                name: "proving-key",
-                ms: Some(t.elapsed().as_millis()),
-                bytes: Some(bytes),
-                error: None,
-            });
+            out.legs.push(Leg::downloaded("proving-key", t.elapsed().as_millis(), bytes));
             pk
         }
         Err(e) => {
-            out.legs.push(Leg { name: "proving-key", ms: None, bytes: None, error: Some(e) });
-            out.total_ms = started.elapsed().as_millis();
-            return out;
+            out.legs.push(Leg::failed("proving-key", None, e));
+            return out.finished(started);
         }
     };
 
@@ -453,18 +487,12 @@ pub async fn run(circuit: &str) -> Run {
     let t = Instant::now();
     let matrices = match load_matrices(circuit).await {
         Ok((m, bytes)) => {
-            out.legs.push(Leg {
-                name: "matrices",
-                ms: Some(t.elapsed().as_millis()),
-                bytes: Some(bytes),
-                error: None,
-            });
+            out.legs.push(Leg::downloaded("matrices", t.elapsed().as_millis(), bytes));
             m
         }
         Err(e) => {
-            out.legs.push(Leg { name: "matrices", ms: None, bytes: None, error: Some(e) });
-            out.total_ms = started.elapsed().as_millis();
-            return out;
+            out.legs.push(Leg::failed("matrices", None, e));
+            return out.finished(started);
         }
     };
     out.num_instance_variables = Some(matrices.num_instance_variables);
@@ -475,19 +503,14 @@ pub async fn run(circuit: &str) -> Run {
     entering(circuit, "engine-witness");
     let engine = engine_witness(circuit, shape).await;
     if let Some(ms) = engine.load_wasm_ms {
-        out.legs.push(Leg { name: "engine-wasm", ms: Some(ms), bytes: None, error: None });
+        out.legs.push(Leg::timed("engine-wasm", Some(ms)));
     }
-    let witness: Option<Vec<Fr>> = match &engine.witness {
+    let from_engine: Option<Vec<Fr>> = match &engine.witness {
         Ok(w) => {
-            out.legs.push(Leg {
-                name: "engine-witness",
-                ms: engine.witness_ms,
-                bytes: None,
-                error: None,
-            });
+            out.legs.push(Leg::timed("engine-witness", engine.witness_ms));
             out.witness_source = Some("engine");
             out.witness_len = Some(w.len());
-            Some(to_field(w))
+            Some(to_field(w.iter().copied()))
         }
         Err(e) => {
             // NOT fatal, and not silent. `calculate_witness` runs circom's
@@ -495,68 +518,52 @@ pub async fn run(circuit: &str) -> Run {
             // a build with no seam refuses here by construction. Either way
             // the leg records what happened and the replica takes over, so the
             // proof is still measured.
-            out.legs.push(Leg {
-                name: "engine-witness",
-                ms: engine.witness_ms,
-                bytes: None,
-                error: Some(e.clone()),
-            });
+            out.legs.push(Leg::failed("engine-witness", engine.witness_ms, e.clone()));
             None
         }
     };
 
     // ── the replica, when the engine's own call did not produce one ───────
-    let witness = match witness {
+    let witness = match from_engine {
         Some(w) => w,
         None => {
             entering(circuit, "probe-witness");
             let wasm = match witness_circuit::fetch_wasm(circuit).await {
                 Ok((_, wasm)) => wasm,
                 Err(e) => {
-                    out.legs.push(Leg { name: "probe-witness", ms: None, bytes: None, error: Some(e) });
-                    out.total_ms = started.elapsed().as_millis();
-                    return out;
+                    out.legs.push(Leg::failed("probe-witness", None, e));
+                    return out.finished(started);
                 }
             };
-            let (probe, values) = witness_circuit::measure_witness(ENGINE_BACKEND, circuit, shape, &wasm);
-            match values {
-                Some(values) => {
-                    out.legs.push(Leg {
-                        name: "probe-witness",
-                        ms: probe.witness_ms,
-                        bytes: None,
-                        error: None,
-                    });
-                    out.witness_source = Some("probe");
-                    out.witness_len = Some(values.len());
-                    to_field(&values.iter().map(|v| U256::from(v.clone())).collect::<Vec<_>>())
-                }
-                None => {
-                    out.legs.push(Leg {
-                        name: "probe-witness",
-                        ms: None,
-                        bytes: None,
-                        error: probe.error.clone().or(Some(format!("reached {}", probe.reached))),
-                    });
-                    out.total_ms = started.elapsed().as_millis();
-                    return out;
-                }
-            }
+            let (probe, values) =
+                witness_circuit::measure_witness(ENGINE_BACKEND, circuit, shape, &wasm);
+            let Some(values) = values else {
+                let why = probe
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("reached {}", probe.reached));
+                out.legs.push(Leg::failed("probe-witness", None, why));
+                return out.finished(started);
+            };
+            out.legs.push(Leg::timed("probe-witness", probe.witness_ms));
+            out.witness_source = Some("probe");
+            out.witness_len = Some(values.len());
+            to_field(values.iter().map(|v| U256::from(v.clone())))
         }
     };
 
     // ── the proof, which is the number this module exists for ─────────────
     entering(circuit, "prove");
     match prove(&pk, matrices, &witness) {
-        Ok((prove_ms, verify_ms, verified)) => {
-            out.legs.push(Leg { name: "prove", ms: Some(prove_ms), bytes: None, error: None });
-            out.legs.push(Leg { name: "verify", ms: Some(verify_ms), bytes: None, error: None });
-            out.verified = Some(verified);
+        Ok(p) => {
+            out.legs.push(Leg::timed("prove", Some(p.prove_ms)));
+            out.legs.push(Leg::timed("verify", Some(p.verify_ms)));
+            out.verified = Some(p.verified);
         }
-        Err(e) => out.legs.push(Leg { name: "prove", ms: None, bytes: None, error: Some(e) }),
+        Err(e) => out.legs.push(Leg::failed("prove", None, e)),
     }
 
-    out.total_ms = started.elapsed().as_millis();
+    let out = out.finished(started);
     report(&out);
     out
 }

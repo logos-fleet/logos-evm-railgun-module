@@ -44,10 +44,10 @@ use serde_json::{json, Value};
 use userop_kit::signable_user_operation::SignableUserOperation;
 
 use crate::engine::RailgunEngine;
+use crate::proof_circuit;
 use crate::relay;
 use crate::rpc_backend::RpcBackend;
 use crate::web_dependency::{self, Dependency, Leg};
-use crate::proof_circuit;
 use crate::witness_circuit;
 use crate::witness_engine;
 
@@ -235,6 +235,19 @@ impl RpcBackend for EthRpcBackend {
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
+}
+
+/// A probe's `params_json`, where every field is optional. A `--call` with no
+/// argument arrives as the empty string or as `null`, and both mean "the
+/// defaults" rather than a parse error.
+fn optional_params<T: Default + serde::de::DeserializeOwned>(
+    params_json: &str,
+) -> Result<T, serde_json::Error> {
+    let trimmed = params_json.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(T::default());
+    }
+    serde_json::from_str(trimmed)
 }
 
 /// Parse a dependency's `{ ok, ... }` JSON reply. Anything but an explicit
@@ -519,14 +532,9 @@ impl RailgunModule for RailgunModuleImpl {
             #[serde(default)]
             backends: Option<Vec<String>>,
         }
-        let trimmed = params_json.trim();
-        let params: Params = if trimmed.is_empty() || trimmed == "null" {
-            Params::default()
-        } else {
-            match serde_json::from_str(trimmed) {
-                Ok(p) => p,
-                Err(e) => return err(e),
-            }
+        let params: Params = match optional_params(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
         };
         let circuit = params
             .circuit
@@ -596,14 +604,9 @@ impl RailgunModule for RailgunModuleImpl {
             #[serde(default)]
             circuit: Option<String>,
         }
-        let trimmed = params_json.trim();
-        let params: Params = if trimmed.is_empty() || trimmed == "null" {
-            Params::default()
-        } else {
-            match serde_json::from_str(trimmed) {
-                Ok(p) => p,
-                Err(e) => return err(e),
-            }
+        let params: Params = match optional_params(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
         };
         let circuit = params
             .circuit
