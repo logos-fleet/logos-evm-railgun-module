@@ -827,6 +827,12 @@ impl RailgunModule for RailgunModuleImpl {
         json!({
             "ok": run.ok(),
             "chainId": run.chain_id,
+            // WHOSE chain answered, and whether it was a local fork. A fork of
+            // Sepolia agrees with Sepolia about the chain id, the contracts,
+            // the tree and `rootOnChain`, so without these two fields a run on
+            // a desk is indistinguishable from a run on the public chain.
+            "node": run.node,
+            "forked": run.forked,
             "eoa": run.eoa,
             // Decimal strings for the same reason the params are.
             "ethWei": run.eth_wei.map(|v| v.to_string()),
