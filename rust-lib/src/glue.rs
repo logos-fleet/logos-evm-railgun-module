@@ -662,8 +662,10 @@ impl RailgunModule for RailgunModuleImpl {
     }
 
     fn private_send_probe(&mut self, params_json: String) -> String {
+        /// Every field is optional and overrides the matching
+        /// [`private_send::Params`] default.
         #[derive(Deserialize, Default)]
-        struct P {
+        struct Requested {
             #[serde(rename = "chainId", default)]
             chain_id: Option<u64>,
             #[serde(default)]
@@ -678,32 +680,36 @@ impl RailgunModule for RailgunModuleImpl {
             #[serde(default)]
             repeat: Option<bool>,
         }
-        let p: P = match optional_params(&params_json) {
-            Ok(p) => p,
+        let requested: Requested = match optional_params(&params_json) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
         let mut params = private_send::Params::default();
-        if let Some(c) = p.chain_id {
+        if let Some(c) = requested.chain_id {
             params.chain_id = c;
         }
-        if let Some(a) = &p.asset {
+        if let Some(a) = &requested.asset {
             match Address::from_str(a) {
                 Ok(a) => params.asset = Some(a),
                 Err(e) => return err(format!("bad asset address {a:?}: {e}")),
             }
         }
-        for (raw, field) in [(&p.shield, &mut params.shield), (&p.transfer, &mut params.transfer)] {
-            if let Some(v) = raw {
-                match parse_amount(v) {
-                    Ok(v) => *field = v,
-                    Err(e) => return err(e),
-                }
+        if let Some(v) = &requested.shield {
+            match parse_amount(v) {
+                Ok(v) => params.shield = v,
+                Err(e) => return err(e),
             }
         }
-        if let Some(m) = p.memo {
+        if let Some(v) = &requested.transfer {
+            match parse_amount(v) {
+                Ok(v) => params.transfer = v,
+                Err(e) => return err(e),
+            }
+        }
+        if let Some(m) = requested.memo {
             params.memo = m;
         }
-        if let Some(r) = p.repeat {
+        if let Some(r) = requested.repeat {
             params.repeat = r;
         }
 

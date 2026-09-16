@@ -93,7 +93,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use eip_1193_provider::provider::{Eip1193Caller, Eip1193Provider};
 use railgun::account::chain::ChainId;
 use railgun::account::signer::RailgunSigner;
@@ -354,17 +354,13 @@ pub async fn run(eip1193: Arc<dyn Eip1193Provider>, p: Params) -> Run {
     // ── the two parties, derived rather than random so a repeat run is one ──
     entering("keys");
     let binding = ChainId::evm(p.chain_id);
-    let (spend, view) = keys::derive_keys_from_seed(PROBE_SEED);
-    let signer = match keys::make_signer(&spend, &view, binding) {
-        Ok(s) => s,
-        Err(e) => {
-            out.legs.push(Leg::failed("keys", None, e));
-            return out.finished(started);
-        }
+    let party = |seed: &[u8]| {
+        let (spend, view) = keys::derive_keys_from_seed(seed);
+        keys::make_signer(&spend, &view, binding)
     };
-    let (r_spend, r_view) = keys::derive_keys_from_seed(PROBE_RECIPIENT_SEED);
-    let recipient = match keys::make_signer(&r_spend, &r_view, binding) {
-        Ok(s) => s,
+    let parties = party(PROBE_SEED).and_then(|s| party(PROBE_RECIPIENT_SEED).map(|r| (s, r)));
+    let (signer, recipient) = match parties {
+        Ok(pair) => pair,
         Err(e) => {
             out.legs.push(Leg::failed("keys", None, e));
             return out.finished(started);
@@ -454,11 +450,10 @@ pub async fn run(eip1193: Arc<dyn Eip1193Provider>, p: Params) -> Run {
     // instead of a proof when verification fails, so a leg that completes here is
     // a proof a verifier accepted -- which is the thing placeholder values could
     // never give (#213, and see [`crate::proof_circuit`]).
-    let mut merkleroot: Option<alloy::primitives::U256> = None;
-    for name in ["transfer-cold", "transfer-warm"] {
-        if name == "transfer-warm" && !p.repeat {
-            break;
-        }
+    let mut merkleroot: Option<U256> = None;
+    let passes: &[&'static str] =
+        if p.repeat { &["transfer-cold", "transfer-warm"] } else { &["transfer-cold"] };
+    for &name in passes {
         entering(name);
         // The note is still unspent as far as this engine knows -- nothing
         // nullified it, because nothing was broadcast -- so the second run
@@ -528,7 +523,7 @@ pub async fn run(eip1193: Arc<dyn Eip1193Provider>, p: Params) -> Run {
 async fn root_on_chain(
     provider: &dyn Eip1193Provider,
     smart_wallet: Address,
-    root: alloy::primitives::U256,
+    root: U256,
 ) -> Result<bool, String> {
     alloy::sol! {
         function rootHistory(uint256 treeNumber, bytes32 root) external view returns (bool);
@@ -536,7 +531,7 @@ async fn root_on_chain(
     provider
         .sol_call(
             smart_wallet,
-            rootHistoryCall { treeNumber: alloy::primitives::U256::from(TREE_NUMBER), root: root.into() },
+            rootHistoryCall { treeNumber: U256::from(TREE_NUMBER), root: root.into() },
         )
         .await
         .map_err(|e| format!("rootHistory: {e}"))
@@ -617,10 +612,6 @@ mod tests {
     // would insert a second leaf and change the tree the proof is built over).
     #[test]
     fn the_syncer_answers_only_inside_its_block_range() {
-        let syncer = OneShieldSyncer::new(7, vec![]);
-        assert_eq!(block_on(syncer.latest_block()).unwrap(), 7);
-        assert_eq!(block_on(syncer.sync(1, 7)).unwrap().len(), 0);
-        // (empty above only because the event list is; the range logic is below)
         let event = SyncEvent::Legacy(
             railgun::indexer::syncer::LegacyCommitment {
                 hash: ruint::aliases::U256::from(1),
@@ -630,6 +621,7 @@ mod tests {
             7,
         );
         let syncer = OneShieldSyncer::new(7, vec![event]);
+        assert_eq!(block_on(syncer.latest_block()).unwrap(), 7);
         assert_eq!(block_on(syncer.sync(1, 7)).unwrap().len(), 1, "block 7 is in [1, 7]");
         assert_eq!(block_on(syncer.sync(1, 6)).unwrap().len(), 0, "not synced that far yet");
         assert_eq!(block_on(syncer.sync(8, 99)).unwrap().len(), 0, "already past it");
@@ -665,11 +657,12 @@ mod tests {
     #[cfg(feature = "engine_seam")]
     #[test]
     fn a_shielded_balance_appears_with_no_chain_state() {
-        let mut p = Params { repeat: false, ..Default::default() };
-        p.shield = 1_234_567;
-        // Stop before the proof: this test is about the balance, and the proof
-        // needs 3.5 MB of artifacts. `transfer > shield` would refuse early, so
-        // the stop is made by asserting on the legs rather than by a flag.
+        let p = Params { repeat: false, shield: 1_234_567, ..Default::default() };
+        // `run` goes on to the transfer leg, which needs 3.5 MB of artifacts --
+        // that is the `#[ignore]`d test below. There is no flag that stops
+        // short of it (`transfer > shield` refuses before the engine is even
+        // built), so this test asserts only on the legs up to `balance` and
+        // lets the transfer land however the network allows.
         let out = block_on(run(offline_chain(), p.clone()));
         assert_eq!(out.balance, Some(p.shield), "{out:?}");
         assert!(out.from.unwrap().starts_with("0zk1"));
