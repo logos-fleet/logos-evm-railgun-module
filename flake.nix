@@ -178,11 +178,30 @@
       androidBareCheckSystems = builtins.filter
         (s: ((module.legacyPackages.${s}.mobile or { }) ? aarch64-android))
         (builtins.attrNames (module.legacyPackages or { }));
+
+      # ── AND THE SIMULATOR, which was down too and nobody knew ─────────────
+      #
+      # The same `wasmi` bindgen refused `aarch64-ios-simulator` as well, with a
+      # different diagnostic (bindgen's libclang does not know the `-sim`
+      # triple), and that one had gone unnoticed for exactly the same reason: no
+      # Bundled set had yet asked for railgun on a simulator, so nothing built
+      # it. Two of three mobile targets, one root cause, one check each.
+      #
+      # aarch64-darwin only, and not because of the pseudo-system: iOS cross
+      # reaches Xcode through /Applications, so this derivation is `__noChroot`
+      # and exists on a Mac or not at all. That also makes it a check of the
+      # VENUE's Xcode as much as of this crate — which is the right trade here,
+      # since an Xcode that cannot build an iOS module is worth a red test.
+      iosSimBare = (module.packages.aarch64-ios-simulator or { }).bare or null;
     in
     {
-      checks = nixpkgs.lib.genAttrs androidBareCheckSystems (s: {
-        android-bare = module.legacyPackages.${s}.mobile.aarch64-android.bare;
-      });
+      checks = nixpkgs.lib.genAttrs androidBareCheckSystems (s:
+        {
+          android-bare = module.legacyPackages.${s}.mobile.aarch64-android.bare;
+        }
+        // nixpkgs.lib.optionalAttrs (s == "aarch64-darwin" && iosSimBare != null) {
+          ios-simulator-bare = iosSimBare;
+        });
 
       packages = nixpkgs.lib.genAttrs (systems ++ mobileTargets)
         (target: withoutWeb module.packages.${target});

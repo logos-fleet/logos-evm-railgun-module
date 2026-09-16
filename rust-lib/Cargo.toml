@@ -51,28 +51,40 @@ logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 # device, in the same process (#188) — the measurement that found iOS kills the
 # process at the JIT's first emitted call.
 #
-# AND IT IS NOT ASKED FOR ON ANDROID (#202). wasmer's build script generates the
-# `wasmi` C-API bindings with bindgen, and in a Logos Android cross build bindgen
-# is handed `--target aarch64-linux-android` with the BUILD platform's nix
-# libcxx headers and no NDK sysroot, so libcxx's `platform.h` reaches for a
-# `features.h` that is not on the include path:
+# AND IT IS ASKED FOR ONLY WHERE ITS BINDGEN WORKS (#202). wasmer's build script
+# generates the `wasmi` C-API bindings with bindgen, and bindgen is the part of
+# this graph that a Logos cross build does not configure. TWO of the three mobile
+# targets failed on it, each with its own clang diagnostic, and both since #188
+# added the feature:
 #
-#   Unable to generate bindings for `wasmi`!: ClangDiagnostic(... 'features.h' file not found)
+#   aarch64-android          bindgen gets `--target aarch64-linux-android` with the
+#                            BUILD platform's nix libcxx headers and no NDK
+#                            sysroot, so libcxx's `platform.h` reaches for a
+#                            `features.h` that is not on the include path:
+#                              ... ClangDiagnostic(... 'features.h' file not found)
+#   aarch64-ios-simulator    bindgen's own libclang rejects the triple outright:
+#                              ... ClangDiagnostic("error: version 'sim' in target
+#                              triple 'arm64-apple-ios-sim' is invalid")
 #
-# That took the whole Android Bare build down, and with it EVERY Android Bundled
-# set whose closure touches this module's catalog entry — this module is in the
-# mobile catalog, so "whose closure touches it" is not only "which names it".
-# Android has no JIT restriction and never needed the interpreter: the measured
-# question belongs to iOS. `cfg(not(target_os = "android"))` rather than a bare
-# `cfg(target_os = "ios")` because a desktop is where the probe's own positive
-# control runs (`witness_engine`'s tests compare the two backends on a platform
-# that allows RWX), and that control is what makes a handset's answer mean
-# anything.
+# The Android one took every Android Bundled set whose closure touches this
+# module's catalog entry down with it — this module is in the mobile catalog, so
+# "whose closure touches it" is not only "which names it" — and the simulator one
+# did the same there, unnoticed, because no set had yet asked for railgun on a
+# simulator.
+#
+# NOTHING IS LOST ON EITHER. The question the interpreter answers is "the JIT is
+# refused here, what works instead", and it is a question about a PHYSICAL iOS
+# device: Android executes emitted code freely (measured — see docs/specs.md:
+# `witness_engine_probe` on a Samsung SM-G990B reaches `call` under cranelift and
+# answers 42), and a simulator's pages are macOS pages where RWX is allowed, so
+# it proves nothing a desktop does not. What remains is `aarch64-apple-ios`,
+# which is exactly where #188 measured, and every desktop — the probe's positive
+# control, which is what makes a handset's answer mean anything.
 #
 # Cargo UNIONS features across these sections, so this is exactly the old line
-# on every target but one. The day bindgen is given the NDK sysroot, delete the
-# section and put `"wasmi"` back beside `"default"`.
-[target.'cfg(not(target_os = "android"))'.dependencies]
+# everywhere it is still asked for. Widen the cfg back the day bindgen is given
+# the NDK sysroot and a libclang that knows `-sim`.
+[target.'cfg(not(any(target_os = "android", target_abi = "sim")))'.dependencies]
 wasmer = { version = "6.1", default-features = false, features = ["wasmi"] }
 
 [features]
