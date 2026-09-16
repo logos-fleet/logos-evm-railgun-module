@@ -362,6 +362,78 @@ and a mismatch is an error instead of a measurement:
 `create_proof_with_reduction_and_matrices` zips the assignment against the
 key's bases, so a short one would otherwise be proven over silently.
 
+### `private_send_probe(params_json) → { ok, engineSeam, chainId, asset, from, to, balance, circuit, rootOnChain, calldataBytes, totalMs, legs, error }`
+**A whole private send, through the engine's own path, on a chain with no money
+in it** (#213).
+
+`proof_circuit_probe` above proved the engine's own `calculate_witness` runs on
+a device — but over the circuit's real *shape* with placeholder *values*, so its
+proof could not verify and `verified: false` was both the honest answer and the
+honest limit. Nothing had ever run `TransactCircuitInputs::from_inputs` (note
+decryption, merkle proof, EdDSA signature over the bound-params hash,
+output-note encryption), and nothing had produced a RAILGUN proof a verifier
+accepts. The reason was chain state: a private send spends a note a mined
+`shield` put in the contract's tree, and the venue's account has no testnet
+funds.
+
+**What this probe substitutes, and nothing else.** The engine learns about notes
+through exactly one public seam — `UtxoSyncer`, which
+`RailgunBuilder::with_utxo_syncer` lets a consumer replace. So the probe hands
+the engine a syncer that emits ONE `Shield` event, encrypted to the probe's own
+address by the ENGINE's own `encrypt_shield` (the call `ShieldBuilder::build`
+makes for every shield this module has ever prepared, re-exported by
+`patch-kohaku-engine-seam.sh` alongside `calculate_witness`). Everything after
+that is the engine:
+
+| leg | what the ENGINE does |
+|---|---|
+| `keys` | — the probe derives its own signer + counterparty from fixed seeds |
+| `shield` | `encrypt_shield` → one `Shield` event (**the only fabricated thing**) |
+| `engine` | `RailgunBuilder::build` over a `MemoryDatabase`, `register` |
+| `sync` | decrypts the commitment into a `UtxoNote`, inserts the leaf, asks the chain to verify the root |
+| `balance` | `RailgunProvider::balance` — the shielded balance the note gives it |
+| `transfer-cold` | `TransactionBuilder` → circuit inputs → `calculate_witness` → `Groth16Prover::prove` **and verify** |
+| `transfer-warm` | the same again, with the artifact loader's cache warm: compute only |
+| `root-on-chain` | `RailgunSmartWallet.rootHistory(tree, root)` for the root the proof was built over |
+
+**`ok` here DOES mean the proof verified.** `Groth16Prover::prove` returns
+`InvalidProof` instead of a proof when `verify_proof` says no, so a green
+`transfer-cold` is a proof a verifier accepted — which is exactly what
+placeholder values could never give.
+
+**And the limit is in the result, not in a footnote.** `rootOnChain` is `false`:
+the note is cryptographically genuine (its commitment is the poseidon hash the
+contract would store, its nullifier the one the contract would consume, its
+merkle proof verifies against the root the engine computed) but no shield was
+mined, so that root is not in the smart wallet's history and this calldata would
+revert. Turning that boolean true needs a funded account — #213's remaining
+acceptance clause, and an operator step.
+
+`{ "chainId"?: u64, "asset"?: "0x…", "shield"?: "1000000", "transfer"?:
+"400000", "memo"?: string, "repeat"?: bool }` — all optional, so
+`private_send_probe()` is a complete call. Amounts are decimal strings.
+Needs the network (~3.5 MB of artifacts) and `eth_rpc_module`.
+
+**It cannot touch the user's wallet**: its own `RailgunProvider` over a
+`MemoryDatabase`, keys derived from a fixed probe seed — not the module's
+engine, not its persistence dir, not the user's keys, and nothing written
+anywhere.
+
+**MEASURED on the host** (aarch64-darwin, `cargo test --features engine_seam --
+--ignored`, dev profile — a control for the shape, not a number to quote):
+
+```
+railgun_module: private-send probe: SENT (seam=true chain=11155111
+  circuit=Some("01x02") balance=Some(1000000) rootOnChain=Some(false)
+  calldata=Some(1956)B shield=Some(11)ms engine=Some(2)ms sync=Some(15)ms
+  balanceMs=Some(2) transferCold=Some(19967)ms transferWarm=Some(13754)ms
+  total=33780ms)
+```
+
+One nullifier in, two commitments out — the transfer and the engine's own change
+note — so the circuit is `railgun/01x02`, the same one `proof_circuit_probe`
+measured, and the two are comparable leg for leg.
+
 ### `web_dependency_probe() → { ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread, callerKind, callerIdentity, callerIsThisModule, legs }`
 **Can this module reach its `web` dependency from a handset?** On a phone
 `keystore_module` is a `web` (wasm) variant — a page in the Shell's container —
