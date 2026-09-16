@@ -85,40 +85,47 @@ found=$(grep -c -x -F "$anchor" "$target" || true)
 [ "$found" = 1 ] || die "expected exactly one '$anchor' in $target, found $found. \
 kohaku changed the witness backend line; re-read it before re-anchoring (#188)."
 
-awk -v anchor="$anchor" '
+# The replacement, written out VERBATIM rather than escaped through a stack of
+# `print` statements: what lands in the file is what you read here.
+replacement=$(cat <<'RUST'
+    // ── #188: the witness backend is CHOSEN here ──────────────────────
+    // Patched at build time by logos-evm-railgun-module
+    // (rust-lib/patch-kohaku-witness-backend.sh). `Store::default()` is
+    // the cranelift JIT, and a physical iOS device kills the process the
+    // instant it enters emitted code. `wasmi` is wasmer's pure-Rust
+    // interpreter: no emitted code, nothing for the platform to refuse.
+    // Android JITs fine (measured), so only iOS-the-device is diverted.
+    //
+    // Each branch announces ITSELF, and the two texts differ on purpose:
+    // the iOS one is the only string in the image that can only come from
+    // the interpreter branch, so `strings <the iOS Bare framework>` proves
+    // which branch was compiled in without running anything -- and on a
+    // device it is the console line beside a witness, whose failure mode
+    // is the process disappearing before it can report.
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    let mut store = {
+        let s = Store::new(wasmer::wasmi::Wasmi::new());
+        eprintln!(
+            "railgun: witness store backend = {} (#188 iOS: the interpreter, no JIT)",
+            s.engine().deterministic_id()
+        );
+        s
+    };
+    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
+    let mut store = {
+        let s = Store::default();
+        eprintln!(
+            "railgun: witness store backend = {} (#188: the platform default)",
+            s.engine().deterministic_id()
+        );
+        s
+    };
+RUST
+)
+
+replacement="$replacement" awk -v anchor="$anchor" '
   $0 == anchor {
-    print "    // ── #188: the witness backend is CHOSEN here ──────────────────────"
-    print "    // Patched at build time by logos-evm-railgun-module"
-    print "    // (rust-lib/patch-kohaku-witness-backend.sh). `Store::default()` is"
-    print "    // the cranelift JIT, and a physical iOS device kills the process the"
-    print "    // instant it enters emitted code. `wasmi` is wasmer'\''s pure-Rust"
-    print "    // interpreter: no emitted code, nothing for the platform to refuse."
-    print "    // Android JITs fine (measured), so only iOS-the-device is diverted."
-    print "    //"
-    print "    // Each branch announces ITSELF, and the two texts differ on purpose:"
-    print "    // the iOS one is the only string in the image that can only come from"
-    print "    // the interpreter branch, so `strings <the iOS Bare framework>` proves"
-    print "    // which branch was compiled in without running anything -- and on a"
-    print "    // device it is the console line beside a witness, whose failure mode"
-    print "    // is the process disappearing before it can report."
-    print "    #[cfg(all(target_os = \"ios\", not(target_abi = \"sim\")))]"
-    print "    let mut store = {"
-    print "        let s = Store::new(wasmer::wasmi::Wasmi::new());"
-    print "        eprintln!("
-    print "            \"railgun: witness store backend = {} (#188 iOS: the interpreter, no JIT)\","
-    print "            s.engine().deterministic_id()"
-    print "        );"
-    print "        s"
-    print "    };"
-    print "    #[cfg(not(all(target_os = \"ios\", not(target_abi = \"sim\"))))]"
-    print "    let mut store = {"
-    print "        let s = Store::default();"
-    print "        eprintln!("
-    print "            \"railgun: witness store backend = {} (#188: the platform default)\","
-    print "            s.engine().deterministic_id()"
-    print "        );"
-    print "        s"
-    print "    };"
+    print ENVIRON["replacement"]
     patched++
     next
   }

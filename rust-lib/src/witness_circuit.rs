@@ -204,7 +204,10 @@ pub struct Probe {
     /// wasmer's own id for the engine that was built (`cranelift`, `wasmi`…).
     pub backend: String,
     pub reached: &'static str,
+    /// Wall clock for `Module::new` alone — the artifact is already in memory.
     pub compile_ms: Option<u128>,
+    /// Everything between a compiled module and a calculator ready to be fed:
+    /// the runtime, the shape check ([`Probe::signals`]) and the calculator.
     pub instantiate_ms: Option<u128>,
     /// Wall clock for `calculate_witness` alone — no download, no compile.
     pub witness_ms: Option<u128>,
@@ -299,7 +302,7 @@ pub fn run(circuit: &str, backends: &[Backend], wasm: &[u8], url: String, downlo
 /// One backend, announced and reported as it happens — an earlier backend's
 /// number survives a later one's death.
 pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
-    let p = one(which, circuit, shape, wasm);
+    let p = measure(which, circuit, shape, wasm);
     eprintln!(
         "railgun_module: witness-circuit probe [{}] {circuit}: {} (backend={} reached={} \
          compile={:?}ms instantiate={:?}ms witness={:?}ms len={:?} nonzero={:?} error={:?})",
@@ -317,7 +320,9 @@ pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -
     p
 }
 
-fn one(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
+/// The stages themselves, silent about the outcome: [`probe_backend`] is what
+/// reports it.
+fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
     entering(which, circuit, stage::ENGINE);
     let mut store = which.store();
     let mut out = Probe {
@@ -376,10 +381,14 @@ fn one(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
         }
     };
     out.instantiate_ms = Some(t.elapsed().as_millis());
-    out.reached = stage::INSTANTIATE;
-    if out.signals.iter().all(|s| s.declared.is_some()) {
-        out.reached = stage::SIGNALS;
-    }
+    // SIGNALS only when the circuit answered for every one of them: a circuit
+    // without `getInputSignalSize` leaves them unchecked, which is not the same
+    // as checked-and-agreed (see `SignalCheck::declared`).
+    out.reached = if out.signals.iter().all(|s| s.declared.is_some()) {
+        stage::SIGNALS
+    } else {
+        stage::INSTANTIATE
+    };
 
     entering(which, circuit, stage::WITNESS);
     let t = Instant::now();
@@ -448,20 +457,14 @@ mod tests {
         assert_eq!(Shape::parse(""), None);
     }
 
-    // The addressing circom uses for a signal name. Pinned against a value
-    // computed independently (FNV-1a 64 of "merkleRoot"), because a wrong hash
-    // does not fail loudly — it addresses a signal that does not exist and the
-    // circuit simply never runs.
+    // The addressing circom uses for a signal name, pinned against a LITERAL
+    // (FNV-1a 64 of "merkleRoot", computed outside this crate) rather than
+    // against a second copy of the algorithm, which would agree with any
+    // mistake made twice. A wrong hash does not fail loudly: it addresses a
+    // signal that does not exist and the circuit simply never runs.
     #[test]
     fn signal_names_hash_the_way_circom_addresses_them() {
-        let (msb, lsb) = fnv("merkleRoot");
-        let h = ((msb as u64) << 32) | lsb as u64;
-        let mut expect: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in b"merkleRoot" {
-            expect ^= *b as u64;
-            expect = expect.wrapping_mul(0x100_0000_01b3);
-        }
-        assert_eq!(h, expect);
+        assert_eq!(fnv("merkleRoot"), (0x7221_b8af, 0x4b93_a6c3));
         assert_ne!(fnv("merkleRoot"), fnv("boundParamsHash"));
     }
 

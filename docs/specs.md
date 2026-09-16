@@ -424,7 +424,7 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   A DESKTOP CALIBRATION FIRST, from `cargo test -- --ignored` on aarch64-darwin
   (`the_real_circuit_generates_a_witness_on_every_backend`):
 
-  | backend | compile | witness | witness |
+  | backend | compile | witness | witness out |
   |---|---|---|---|
   | `wasmi` (what iOS gets) | 292 ms | 14 206 ms | 10 190 signals, 9 290 non-zero |
   | `cranelift` (everything else) | 4 259 ms | 229 ms | 10 190 signals, 9 290 non-zero |

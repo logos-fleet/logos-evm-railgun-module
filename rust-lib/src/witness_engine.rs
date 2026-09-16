@@ -191,6 +191,28 @@ pub const PROBE_ORDER: &[Backend] = &[Backend::Wasmi, Backend::EngineDefault];
 #[cfg(any(target_os = "android", target_abi = "sim"))]
 pub const PROBE_ORDER: &[Backend] = &[Backend::EngineDefault];
 
+/// Resolve [`Backend::requested`] names against what is actually IN this image,
+/// in the order asked.
+///
+/// A name that is not here is an error NAMING the backends that are — `wasmi`
+/// is absent on Android and the iOS simulator (#202), and dropping it silently
+/// would report a measurement of a backend set nobody asked for.
+pub fn backends_named(names: &[String]) -> Result<Vec<Backend>, String> {
+    names
+        .iter()
+        .map(|name| {
+            PROBE_ORDER
+                .iter()
+                .copied()
+                .find(|b| b.requested() == name)
+                .ok_or_else(|| {
+                    let have: Vec<&str> = PROBE_ORDER.iter().map(|b| b.requested()).collect();
+                    format!("no backend '{name}' in this image; have: {}", have.join(", "))
+                })
+        })
+        .collect()
+}
+
 /// What the probe found.
 #[derive(Debug, Clone)]
 pub struct Probe {
@@ -378,6 +400,29 @@ mod tests {
             p.answer,
             p.error
         );
+    }
+
+    // A caller names the backends it wants (`{"backends":["wasmi"]}` on a
+    // device where the JIT kills the process), so the resolution is part of the
+    // contract: the order asked is the order measured, and a name this image
+    // does not have is refused rather than dropped.
+    #[test]
+    fn named_backends_resolve_in_the_order_asked() {
+        let asked: Vec<String> = PROBE_ORDER
+            .iter()
+            .rev()
+            .map(|b| b.requested().to_string())
+            .collect();
+        let picked = backends_named(&asked).expect("every name in PROBE_ORDER resolves");
+        let back: Vec<&str> = picked.iter().map(|b| b.requested()).collect();
+        assert_eq!(back, asked, "the order asked is the order returned");
+
+        let e = backends_named(&["gcc".to_string()]).expect_err("there is no 'gcc' backend");
+        assert!(
+            e.contains("gcc") && e.contains("engine-default"),
+            "the error must name the stranger AND what is here: {e}"
+        );
+        assert!(backends_named(&[]).expect("an empty list is not an error").is_empty());
     }
 
     // The engine's own backend goes LAST. On a platform that kills the process

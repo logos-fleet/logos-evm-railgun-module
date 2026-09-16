@@ -508,30 +508,12 @@ impl RailgunModule for RailgunModuleImpl {
         // Named backends are resolved against what is actually IN this image,
         // so asking for one that is not (`wasmi` on Android, #202) is an error
         // naming the ones there are rather than a silently shorter run.
-        let backends: Vec<witness_engine::Backend> = match params.backends {
+        let backends = match params.backends {
             None => witness_engine::PROBE_ORDER.to_vec(),
-            Some(names) => {
-                let mut picked = Vec::with_capacity(names.len());
-                for name in &names {
-                    match witness_engine::PROBE_ORDER
-                        .iter()
-                        .find(|b| b.requested() == name)
-                    {
-                        Some(b) => picked.push(*b),
-                        None => {
-                            let have: Vec<&str> = witness_engine::PROBE_ORDER
-                                .iter()
-                                .map(|b| b.requested())
-                                .collect();
-                            return err(format!(
-                                "no backend '{name}' in this image; have: {}",
-                                have.join(", ")
-                            ));
-                        }
-                    }
-                }
-                picked
-            }
+            Some(names) => match witness_engine::backends_named(&names) {
+                Ok(picked) => picked,
+                Err(e) => return err(e),
+            },
         };
 
         let started = Instant::now();
