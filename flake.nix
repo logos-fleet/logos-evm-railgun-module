@@ -73,9 +73,9 @@
       # is no `nix.external_libraries` here, so nothing is staged into lib/ as
       # a build-platform image that the builder could not rebuild.
       #
-      # AND ON iOS IT CANNOT PROVE (#188), which is now MEASURED rather than
-      # feared. `wasmer`'s cranelift backend is a JIT and `ark-circom` runs the
-      # circuit under it, so a witness needs the device to execute code the
+      # AND ON iOS IT COULD NOT PROVE (#188) -- which was MEASURED, and is now
+      # FIXED HERE. `wasmer`'s cranelift backend is a JIT and `ark-circom` runs
+      # the circuit under it, so a witness needs the device to execute code the
       # process wrote itself. On a physical iPad Air (4th gen) the module loads,
       # answers, builds the engine, compiles and instantiates -- and the process
       # is killed with SIGKILL at the instant it enters the emitted code:
@@ -84,14 +84,30 @@
       #   App terminated due to signal 9.
       #
       # `witness_engine_probe` (rust-lib/src/witness_engine.rs) is what asked,
-      # and it asks on any device it is called on. It measures the `wasmi`
-      # interpreter in the same call, which runs the same wasm on the same iPad
-      # to the same answer -- so the way out is a backend swap rather than a
-      # port. It is not one this crate can make: `calculate_witness` builds its
-      # store with `Store::default()`, which answers cranelift for as long as
-      # anything asks wasmer for `sys-default`, and `ark-circom` does. The
-      # artifact here is correct and complete; the shipped SHIELD path (no
-      # proof) works on a phone and transfer/unshield do not. See docs/specs.md.
+      # and it asks on any device it is called on. It measured the `wasmi`
+      # interpreter in the same call -- same wasm, same iPad, same answer -- so
+      # the way out was a backend swap rather than a port.
+      #
+      # THE SWAP IS A BUILD-TIME PATCH OF THE VENDORED ENGINE, not a fork:
+      # `railgun::circuit::witness::calculate_witness` builds its store with
+      # `Store::default()` (cranelift, for as long as anything asks wasmer for
+      # `sys-default`, and `ark-circom` does), `mod witness` is private and
+      # `Groth16Prover` exposes no store seam, so there is nothing to override
+      # from the outside. rust-lib/patch-kohaku-witness-backend.sh -- named by
+      # metadata.json's `nix.rust.env.postPatch`, which reaches EVERY leg
+      # including the mobile cross archives -- rewrites that one line to pick
+      # `wasmi` under `cfg(all(target_os = "ios", not(target_abi = "sim")))` and
+      # `Store::default()` everywhere else. Android JITs freely (#202, measured
+      # on a handset), so only the platform that refuses one is diverted.
+      #
+      # AND THE COST OF THE INTERPRETER IS MEASURED, not assumed:
+      # `witness_circuit_probe` times the REAL circuit through the engine's own
+      # calculator on each backend in the image. On the venue's physical iPad
+      # Air (4th gen) a `railgun/01x02` witness takes 817 ms under `wasmi`,
+      # while the JIT path aborts the app at `instantiate` ("Cannot allocate
+      # memory (os error 12)", which ark-circom unwraps). See docs/specs.md for
+      # both numbers and for what the probe's placeholder inputs do and do not
+      # prove.
       #
       # `? ${t}` rather than a bare index, so a logos-module-builder pin without
       # the mobile cross sets leaves this flake simply WITHOUT mobile keys

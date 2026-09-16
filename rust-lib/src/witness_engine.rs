@@ -60,14 +60,19 @@
 //! than assuming a length, so such a reply carries no `alternatives` instead of
 //! carrying a wrong one.
 //!
-//! IT IS NOT THE BACKEND THE ENGINE USES, and this probe cannot make it one.
+//! AND IT IS NOW THE BACKEND THE ENGINE USES THERE — through a build-time
+//! patch, not through this crate's manifest.
 //! `railgun::circuit::witness::calculate_witness` builds its store with
 //! `Store::default()`, which resolves to cranelift for as long as anything in
 //! the graph asks wasmer for `sys-default` — `ark-circom` does, in a
 //! third-party fork this repo consumes, and cargo unions features, so no line
-//! in this crate's manifest can subtract it. Swapping the engine's backend is
-//! a change to `ark-circom` (or a witness hook in `railgun`); what is settled
-//! here is whether that change has a destination.
+//! in this crate's manifest can subtract it, and the engine crate exposes no
+//! store seam (`mod witness` is private). `rust-lib/patch-kohaku-witness-backend.sh`
+//! rewrites that one line in the VENDORED engine source instead, under exactly
+//! the cfg that gates the feature here, so a physical iOS device proves under
+//! `wasmi` and every other target keeps the default. What this probe settles is
+//! that the destination works; [`crate::witness_circuit`] settles what it costs
+//! (817 ms for a `railgun/01x02` witness on the venue's iPad Air 4).
 //!
 //! ORDER IS LOAD-BEARING: the alternatives run BEFORE the default one. A
 //! backend that gets the process killed takes every answer that would have
@@ -158,7 +163,10 @@ impl Backend {
         }
     }
 
-    fn store(self) -> Store {
+    /// The store this backend builds. `pub(crate)` because
+    /// [`crate::witness_circuit`] measures the SAME backends over the real
+    /// circuit: one list of what is in the image, two questions asked of it.
+    pub(crate) fn store(self) -> Store {
         match self {
             Backend::EngineDefault => Store::default(),
             #[cfg(not(any(target_os = "android", target_abi = "sim")))]
@@ -182,6 +190,28 @@ pub const PROBE_ORDER: &[Backend] = &[Backend::Wasmi, Backend::EngineDefault];
 /// beside it. See [`Backend::Wasmi`].
 #[cfg(any(target_os = "android", target_abi = "sim"))]
 pub const PROBE_ORDER: &[Backend] = &[Backend::EngineDefault];
+
+/// Resolve [`Backend::requested`] names against what is actually IN this image,
+/// in the order asked.
+///
+/// A name that is not here is an error NAMING the backends that are — `wasmi`
+/// is absent on Android and the iOS simulator (#202), and dropping it silently
+/// would report a measurement of a backend set nobody asked for.
+pub fn backends_named(names: &[String]) -> Result<Vec<Backend>, String> {
+    names
+        .iter()
+        .map(|name| {
+            PROBE_ORDER
+                .iter()
+                .copied()
+                .find(|b| b.requested() == name)
+                .ok_or_else(|| {
+                    let have: Vec<&str> = PROBE_ORDER.iter().map(|b| b.requested()).collect();
+                    format!("no backend '{name}' in this image; have: {}", have.join(", "))
+                })
+        })
+        .collect()
+}
 
 /// What the probe found.
 #[derive(Debug, Clone)]
@@ -370,6 +400,29 @@ mod tests {
             p.answer,
             p.error
         );
+    }
+
+    // A caller names the backends it wants (`{"backends":["wasmi"]}` on a
+    // device where the JIT kills the process), so the resolution is part of the
+    // contract: the order asked is the order measured, and a name this image
+    // does not have is refused rather than dropped.
+    #[test]
+    fn named_backends_resolve_in_the_order_asked() {
+        let asked: Vec<String> = PROBE_ORDER
+            .iter()
+            .rev()
+            .map(|b| b.requested().to_string())
+            .collect();
+        let picked = backends_named(&asked).expect("every name in PROBE_ORDER resolves");
+        let back: Vec<&str> = picked.iter().map(|b| b.requested()).collect();
+        assert_eq!(back, asked, "the order asked is the order returned");
+
+        let e = backends_named(&["gcc".to_string()]).expect_err("there is no 'gcc' backend");
+        assert!(
+            e.contains("gcc") && e.contains("engine-default"),
+            "the error must name the stranger AND what is here: {e}"
+        );
+        assert!(backends_named(&[]).expect("an empty list is not an error").is_empty());
     }
 
     // The engine's own backend goes LAST. On a platform that kills the process

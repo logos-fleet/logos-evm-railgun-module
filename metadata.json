@@ -21,6 +21,9 @@
       "packages": {
         "build": ["cmake", "pkg-config", "rustPlatform.bindgenHook"],
         "runtime": []
+      },
+      "env": {
+        "postPatch": "bash ./patch-kohaku-witness-backend.sh"
       }
     },
     "external_libraries": [],

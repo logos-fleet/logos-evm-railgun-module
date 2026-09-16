@@ -36,6 +36,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy::primitives::{Address, B256};
 use serde::Deserialize;
@@ -46,6 +47,7 @@ use crate::engine::RailgunEngine;
 use crate::relay;
 use crate::rpc_backend::RpcBackend;
 use crate::web_dependency::{self, Dependency, Leg};
+use crate::witness_circuit;
 use crate::witness_engine;
 
 pub trait RailgunModule: 'static {
@@ -109,6 +111,29 @@ pub trait RailgunModule: 'static {
     /// the JIT also says what would work instead. Safe to call before `init`.
     /// See [`crate::witness_engine`].
     fn witness_engine_probe(&mut self) -> String;
+    /// AND HOW LONG DOES A REAL WITNESS TAKE?
+    /// `{ "circuit"?: "01x02", "backends"?: ["wasmi", ...] }` →
+    /// `{ ok, circuit, artifactUrl, downloadMs, wasmBytes, sanityCheck,
+    /// probes: [{ requested, backend, reached, compileMs, instantiateMs,
+    /// witnessMs, witnessLen, witnessNonzero, signals, error }] }`.
+    ///
+    /// [`Self::witness_engine_probe`] answers whether a backend MAY run here;
+    /// this answers what it costs, over the circuit the engine really proves
+    /// with — the same `.wasm` `calculate_witness` downloads, through the same
+    /// `ark_circom::WitnessCalculator`, on each backend in the image. It
+    /// matters because the backend a physical iOS device permits is an
+    /// INTERPRETER, and an interpreter that takes minutes is a different
+    /// product decision from one that takes seconds.
+    ///
+    /// Needs the network (it fetches ~900 KB of artifact) and no chain, keys or
+    /// shielded balance: the inputs are the circuit's real SHAPE filled with
+    /// placeholders, checked against the circuit's own `getInputSignalSize`,
+    /// with circom's sanity check off. So it times witness generation honestly
+    /// and proves nothing about a proof VERIFYING. `backends` defaults to every
+    /// backend in the image, engine-default last — name `["wasmi"]` alone on a
+    /// device where the JIT kills the process and the reply survives.
+    /// See [`crate::witness_circuit`].
+    fn witness_circuit_probe(&mut self, params_json: String) -> String;
     /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
     /// `{ ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread,
     /// callerKind, callerIdentity, callerIsThisModule,
@@ -457,6 +482,85 @@ impl RailgunModule for RailgunModuleImpl {
         let mut reply = probe_json(engine);
         reply["alternatives"] = Value::Array(alternatives.iter().map(probe_json).collect());
         reply.to_string()
+    }
+
+    fn witness_circuit_probe(&mut self, params_json: String) -> String {
+        #[derive(Deserialize, Default)]
+        struct Params {
+            #[serde(default)]
+            circuit: Option<String>,
+            #[serde(default)]
+            backends: Option<Vec<String>>,
+        }
+        let trimmed = params_json.trim();
+        let params: Params = if trimmed.is_empty() || trimmed == "null" {
+            Params::default()
+        } else {
+            match serde_json::from_str(trimmed) {
+                Ok(p) => p,
+                Err(e) => return err(e),
+            }
+        };
+        let circuit = params
+            .circuit
+            .unwrap_or_else(|| witness_circuit::DEFAULT_CIRCUIT.to_string());
+
+        // Named backends are resolved against what is actually IN this image,
+        // so asking for one that is not (`wasmi` on Android, #202) is an error
+        // naming the ones there are rather than a silently shorter run.
+        let backends = match params.backends {
+            None => witness_engine::PROBE_ORDER.to_vec(),
+            Some(names) => match witness_engine::backends_named(&names) {
+                Ok(picked) => picked,
+                Err(e) => return err(e),
+            },
+        };
+
+        let started = Instant::now();
+        let (url, wasm) = match block_on(witness_circuit::fetch_wasm(&circuit)) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let download_ms = started.elapsed().as_millis();
+        let run = witness_circuit::run(&circuit, &backends, &wasm, url, download_ms);
+
+        let probes: Vec<Value> = run
+            .probes
+            .iter()
+            .map(|p| {
+                json!({
+                    "ok": p.ok(),
+                    "requested": p.requested,
+                    "backend": p.backend,
+                    "reached": p.reached,
+                    "compileMs": p.compile_ms,
+                    "instantiateMs": p.instantiate_ms,
+                    "witnessMs": p.witness_ms,
+                    "witnessLen": p.witness_len,
+                    "witnessNonzero": p.witness_nonzero,
+                    "signals": p.signals.iter().map(|s| json!({
+                        "name": s.name,
+                        "expected": s.expected,
+                        "declared": s.declared,
+                        "ok": s.ok(),
+                    })).collect::<Vec<Value>>(),
+                    "error": p.error,
+                })
+            })
+            .collect();
+
+        json!({
+            "ok": run.error.is_none() && !run.probes.is_empty()
+                && run.probes.iter().all(witness_circuit::Probe::ok),
+            "circuit": run.circuit,
+            "artifactUrl": run.artifact_url,
+            "downloadMs": run.download_ms,
+            "wasmBytes": run.wasm_bytes,
+            "sanityCheck": witness_circuit::SANITY_CHECK,
+            "probes": probes,
+            "error": run.error,
+        })
+        .to_string()
     }
 
     fn web_dependency_probe(&mut self) -> String {

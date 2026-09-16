@@ -30,6 +30,26 @@ url = "2"
 # the engine proves with (#188). If this drifted from ark-circom's request the
 # probe would measure a backend the engine does not use.
 wasmer = { version = "6.1", default-features = false, features = ["default"] }
+# ── the witness generator itself, for the CIRCUIT probe (#188) ───────────────
+# `ark-circom` is what `railgun::circuit::witness::calculate_witness` drives, and
+# `witness_circuit` times the REAL circuit through the same calculator, over the
+# same artifact, on every backend in the image -- because "the interpreter does
+# not crash" is not an answer until it comes with a number. The version line is
+# the engine's own: `[patch.crates-io]` below redirects it to the fork kohaku
+# pins, so this is the SAME crate the engine uses rather than a second copy.
+# `num-bigint` is the calculator's signal type, `brotli` decompresses the
+# artifact (`wasm.br`) the way the engine's loader does, and `reqwest` fetches it
+# -- all three are already in the graph through the engine, at these versions.
+ark-circom = "0.6"
+num-bigint = "0.4"
+brotli = "8"
+# `default-features = false` VERBATIM as the engine asks for it (kohaku's
+# workspace Cargo.toml): cargo unions features, so this adds not one feature to
+# the graph and the probe goes out over the transport the engine already built
+# -- rustls. Asking for the defaults instead pulls `charset`/`encoding_rs`,
+# which nothing vendored the nix build (measured: "no matching package named
+# `encoding_rs` found").
+reqwest = { version = "0.13", default-features = false }
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
