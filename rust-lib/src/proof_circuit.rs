@@ -13,6 +13,26 @@
 //! downloads and through the SAME arkworks calls `Groth16Prover::prove` makes
 //! (#213).
 //!
+//! THE ANSWER, on the venue's physical iPad Air (4th generation), iOS 26.5.2,
+//! the shipped release build, for `railgun/01x02`:
+//!
+//! ```text
+//! railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+//! proving-key 1509ms/3341841B  matrices 744ms/141046B  engine-wasm 975ms
+//! engine-witness 892ms  prove 383ms  verify 2ms  verified=false  total 4509ms
+//! ```
+//!
+//! **The proof is 383 ms** — not the minute RAILGUN's published figure would
+//! lead you to budget for, and not the dominant cost either. The whole compute
+//! half (witness + proof + verify) is about 1.3 s on an A14; what a FIRST
+//! private send waits for is 3.5 MB of artifact (≈3.2 s cold, ≈1.6 s warm),
+//! which is cacheable and is the network's number. A private send on iOS needs
+//! neither a background job nor a cancel path.
+//!
+//! And the line above it is the one this module was written for: it is printed
+//! from inside the ENGINE's own `calculate_witness`, by the branch #188's patch
+//! compiled in for physical iOS, and before #213 nothing had ever reached it.
+//!
 //! ## The three things it is faithful about
 //!
 //! ARTIFACTS. `proving_key.bin.br` and `matrices.bin.br` come from the engine's

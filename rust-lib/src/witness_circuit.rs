@@ -43,6 +43,14 @@
 //! that would reject these placeholders. What it CANNOT tell you is whether a
 //! proof verifies — that is `prove_transact`'s business and needs the chain.
 //!
+//! BOTH CLAIMS ARE NOW CHECKED rather than argued (#213).
+//! [`crate::proof_circuit`] calls the ENGINE's own `calculate_witness`, which
+//! runs the same circuit with the sanity check ON, on the same device: 892 ms
+//! against this probe's 817 ms. So the assertions are worth about 75 ms and
+//! the placeholders do not shorten the arithmetic. It also runs the Groth16
+//! proof afterwards (383 ms) — and reports `verified: false`, which is what
+//! the placeholder values cost and the one thing neither probe can fix.
+//!
 //! ## The shape is checked against the circuit, not assumed
 //!
 //! A circom witness calculator does not fail when you feed it too few signals:
