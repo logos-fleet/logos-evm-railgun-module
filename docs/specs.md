@@ -68,6 +68,7 @@ railgun_module  (THIS — Rust cdylib, concurrency:single)
 | `eth_rpc_module.raw_rpc_url(chainId, url, method, params)` | submit `eth_sendUserOperation` to the bundler **through net-proxy** |
 | `keystore_module.request_approval(intent)` | ask a human to approve `owner`'s signature over the relayer's userOp hash + its EIP-7702 authorization, as two opaque-digest legs of one bundle |
 | `keystore_module.approval_status` / `fetch_result` / `ack_result` / `cancel_approval` | poll that decision, collect the signatures, then let the keystore wipe its copy |
+| `keystore_module.caller_identity` / `list_accounts` | `web_dependency_probe` only — three diagnostic crossings that measure the seam itself on a device, never used by a wallet path |
 
 The 4337 **submit** is routed through `eth_rpc` (not a module-owned HTTP client) so
 that a private send goes through the same fail-closed proxy as everything else — a
@@ -177,6 +178,39 @@ A platform may refuse by killing the process rather than returning an error — 
 does (#188) — in which case there is no reply at all. Each stage is therefore
 also printed on stderr before it is entered, so a device console still names the
 stage the silence began in.
+
+### `web_dependency_probe() → { ok, target, thread, callerKind, callerIdentity, callerIsThisModule, legs }`
+**Can this module reach its `web` dependency from a handset?** On a phone
+`keystore_module` is a `web` (wasm) variant — a page in the Shell's container —
+while this module is native, Bare, cross-compiled and in-process. ADR 0010
+(logos-workspace `docs/adr/0010-…`) lets a Bundled member depend on the image's
+web half, which is what puts this module in the mobile catalog at all, and it
+rests on the host's claim that a consumer reaches a Web module exactly as it
+reaches a subprocess one. This asks the claim directly, on the device.
+
+Three ordinary crossings to `keystore_module`, in this order, each timed:
+
+| `legs[i].method` | what it settles |
+|---|---|
+| `caller_identity` | the call crossed, and who the page thinks called it |
+| `list_accounts` | an ordinary contract read, so the seam carries a real body |
+| `caller_identity` | a second crossing after one with a body: the transport is still usable and nothing is parked on the thread that must deliver |
+
+`ok` is true only when every leg answered **and** `callerIdentity` is
+`railgun_module`: a crossing that arrives under the wrong name admits nobody
+through a name-gated method, which is exactly what a `web` module did to every
+caller before logos-workspace#129 (fixed there in the `web` → `web` direction;
+this is the native → `web` one). `thread` names the thread the dispatch ran on —
+`BareModuleGlue` marshals every dispatch onto its own `logos-inproc-<module>`
+worker while a page answers on the host's Qt main thread, so the thread that
+waits here must not be the thread that has to deliver. A leg that fails does not
+end the probe. Needs no chain, no keys and no engine; safe to call before `init`.
+
+The calls go through a raw `PluginProxy` rather than `modules().keystore_module`,
+and the two are the same call — a LIDL-generated wrapper for a `String`-returning
+method *is* `proxy.call_json(method, [])`. The proxy measures the transport rather
+than this module's generated copy of someone else's contract, and keeps asking
+against a `keystore_module` pin whose LIDL predates `caller_identity`.
 
 ## Security model & invariants
 
