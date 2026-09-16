@@ -75,7 +75,7 @@
 //! `anvil --fork-url <sepolia>` serves the real Sepolia state — the same
 //! `RailgunSmartWallet` bytecode at the same address, the same WETH, the whole
 //! historical accumulator — from a node that will also credit an account on
-//! request. Point [`the RPC`](tests::RealSepolia) at it (`LOGOS_SEPOLIA_RPC`),
+//! request. Point the acceptance test's RPC at it (`LOGOS_SEPOLIA_RPC`),
 //! `anvil_setBalance` this EOA, and `the_whole_send_lands_on_chain` shields,
 //! mines, syncs, proves, checks `rootHistory` and broadcasts, end to end and
 //! repeatably. docs/specs.md has the recipe and the measured run.
@@ -1111,7 +1111,7 @@ mod tests {
             ("eth_getBalance", json!("0x0")),
             ("eth_call", word(0)),
         ]);
-        let out = block_on(run(chain.clone(), Params::default()));
+        let out = block_on(run(chain, Params::default()));
         assert_eq!(
             out.node.as_deref(),
             Some("anvil/v1.8.1"),
@@ -1132,7 +1132,7 @@ mod tests {
             ("eth_getBalance", json!("0x0")),
             ("eth_call", word(0)),
         ]);
-        let out = block_on(run(chain.clone(), Params::default()));
+        let out = block_on(run(chain, Params::default()));
         assert_eq!(out.node, None);
         assert!(!out.forked, "an unknown node is not a fork, it is unknown");
         assert!(out.needs_funding.is_some(), "it stopped before the funding leg: {out:?}");
