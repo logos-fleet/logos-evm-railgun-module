@@ -3,10 +3,10 @@
 //! transfer / unshield) over the same module bus as keystore / eth-rpc / uniswap.
 //!
 //! Authoring split (mirrors `uniswap_module`): the pure, cargo-testable cores
-//! (`rpc_backend`, `keys`, `db_adapter`, `engine`, `relay`, `witness_engine`) carry no
-//! Logos dependency and are tested with `cargo test --no-default-features`. The `glue` module (behind
-//! the default `logos_module` feature) wires the contract trait to the Logos
-//! runtime via `logos-rust-sdk`.
+//! (`rpc_backend`, `keys`, `db_adapter`, `engine`, `relay`, `witness_engine`)
+//! carry no Logos dependency and are tested with `cargo test
+//! --no-default-features`. The `glue` module (behind the default `logos_module`
+//! feature) wires the contract trait to the Logos runtime via `logos-rust-sdk`.
 //!
 //! ⚠️ The upstream engine is explicitly **unaudited / not production-ready**. This
 //! module is Sepolia-first; mainnet is gated behind an explicit opt-in.

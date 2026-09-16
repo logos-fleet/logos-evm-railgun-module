@@ -420,7 +420,7 @@ impl RailgunModule for RailgunModuleImpl {
     }
 
     fn witness_engine_probe(&mut self) -> String {
-        fn one(p: &witness_engine::Probe) -> Value {
+        fn probe_json(p: &witness_engine::Probe) -> Value {
             json!({
                 "ok": p.ok(),
                 "requested": p.requested,
@@ -437,8 +437,8 @@ impl RailgunModule for RailgunModuleImpl {
         let Some((engine, alternatives)) = all.split_last() else {
             return err("no wasm backend is compiled into this module");
         };
-        let mut reply = one(engine);
-        reply["alternatives"] = Value::Array(alternatives.iter().map(one).collect());
+        let mut reply = probe_json(engine);
+        reply["alternatives"] = Value::Array(alternatives.iter().map(probe_json).collect());
         reply.to_string()
     }
 }

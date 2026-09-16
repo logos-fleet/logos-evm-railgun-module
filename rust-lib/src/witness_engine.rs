@@ -65,10 +65,9 @@
 use wasmer::{imports, Instance, Module, Store};
 
 /// The stages of [`probe`], in the order it takes them. `reached` is the last
-/// one that completed.
+/// one that completed — always at least [`ENGINE`](stage::ENGINE), since
+/// building the store cannot fail politely.
 pub mod stage {
-    /// Nothing ran yet — the engine could not even be built.
-    pub const NONE: &str = "none";
     /// `Store::default()` returned: the backend exists.
     pub const ENGINE: &str = "engine";
     /// `Module::new` returned: native code was emitted AND published.
