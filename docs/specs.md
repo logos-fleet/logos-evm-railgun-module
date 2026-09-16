@@ -174,6 +174,17 @@ interpreter), so a device that refuses the JIT also says what would work instead
 Needs no chain, no keys, no artifact download and no shielded balance; safe to
 call before `init`.
 
+**On Android and on the iOS simulator `alternatives` is empty**, and that is the
+image rather than the probe: `wasmi` is asked for only under
+`cfg(not(any(target_os = "android", target_abi = "sim")))`, because wasmer's
+build script generates its C-API bindings with bindgen and a Logos cross build
+configures bindgen for neither of those two targets (#202 — see
+`rust-lib/Cargo.toml` for both diagnostics). Nothing is lost by it: the question
+the alternative answers belongs to a *physical* iOS device, where it is still
+compiled in; Android executes emitted code freely (measured below) and a
+simulator's pages are macOS pages where RWX is allowed. The headline (`ok`,
+`backend`, `reached`) is the same measurement everywhere.
+
 A platform may refuse by killing the process rather than returning an error — iOS
 does (#188) — in which case there is no reply at all. Each stage is therefore
 also printed on stderr before it is entered, so a device console still names the
@@ -343,7 +354,64 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
 
   Unaffected: `init` / `init_from_seed` / `get_zk_address` / `sync` /
   `get_shielded_balance` / `prepare_shield` — the shield path builds unsigned
-  calldata and needs no proof. Android has no such restriction (unmeasured).
+  calldata and needs no proof.
+
+- **Android has no such restriction, and it is measured now (#202).** The same
+  `witness_engine_probe`, on a physical Samsung SM-G990B (Android 16, arm64-v8a),
+  in an Android Shell carrying `capability_module,railgun_module`:
+
+  ```
+  [shell]   railgun_module loaded in 761 ms
+  [shell] CALL OK railgun_module.witness_engine_probe() ->
+    {"alternatives":[],"answer":42,"backend":"cranelift","error":null,
+     "ok":true,"reached":"call","requested":"engine-default"}
+  ```
+
+  `reached: call` under cranelift: the JIT emits, publishes and RUNS on a handset
+  that is not an iPhone. So the proof paths this module ships are blocked on iOS
+  specifically, not on phones. (`alternatives` is empty because `wasmi` is not in
+  an Android image — see above.)
+
+- **The Android Bare build is a check now (#202).** Adding the `wasmi` feature
+  above for the iOS measurement broke TWO of the three mobile targets outright.
+  wasmer's build script runs bindgen for the `wasmi` C API, and bindgen is the
+  part of this graph a Logos cross build does not configure:
+
+  ```
+  aarch64-android        --target aarch64-linux-android with the build platform's
+                         nix libcxx headers and no NDK sysroot:
+    .../libcxx-19.1.7-dev/include/c++/v1/__configuration/platform.h:35:12:
+        fatal error: 'features.h' file not found
+  aarch64-ios-simulator  bindgen's own libclang rejects the triple:
+    error: version 'sim' in target triple 'arm64-apple-ios-sim' is invalid
+  ```
+
+  Both from `panicked at wasmer-6.1.0/build.rs:422: Unable to generate bindings
+  for 'wasmi'!`, and both measured at the pre-fix pin.
+
+  It was invisible for as long as nobody asked a phone for anything — #148
+  verified all three mobile targets by hand, #188 measured on a physical iOS
+  device, and no check compiled either cross — and it surfaced five derivations
+  away, as `catalog-logos-basecamp-mobile-dev` refusing to evaluate. Since this
+  module is a mobile catalog member, that took down *every* Android Bundled set
+  whose closure touches it, not only one that names it.
+
+  Two things came out of it. `wasmi` is asked for only where its bindgen works
+  (`[target.'cfg(not(any(target_os = "android", target_abi = "sim")))'
+  .dependencies]`, which keeps it on a physical iOS device — where the question
+  is — and on every desktop, with exactly the old feature set there), and the
+  flake now exposes `checks.<build-system>.android-bare` — the real Bare
+  artifact, not a `cargo check`, because the failure was in a dependency's build
+  script and the Android DT_NEEDED gate is worth running too. It needs no device:
+
+  ```
+  nix build <workspace>#checks.aarch64-darwin.logos-evm-railgun-module--android-bare
+  ws test logos-evm-railgun-module --local logos-evm-railgun-module
+  ```
+
+  The check is empty under this repo's *own* `flake.lock`, whose published
+  logos-module-builder has no mobile cross sets; it is real for every consumer
+  that supplies a builder which does.
 
 - **No `web` (wasm) variant, and not for a reason in this repo (#168).** The flake
   withholds `packages.<system>.web`. What blocks it, measured rather than assumed:

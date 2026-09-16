@@ -43,6 +43,23 @@
 //! here" is "and this is what works instead", measured on the same device in
 //! the same process rather than hoped for in a follow-up.
 //!
+//! EXCEPT WHERE IT IS NOT IN THE IMAGE AT ALL (#202). `wasmi` is asked for only
+//! under `cfg(not(any(target_os = "android", target_abi = "sim")))`, because
+//! wasmer's build script generates its C-API bindings with bindgen and a Logos
+//! cross build configures bindgen for neither the Android NDK sysroot nor the
+//! `-sim` triple — see the note on that section in `rust-lib/Cargo.toml` for
+//! both diagnostics and the conditions for widening it back.
+//!
+//! It costs this probe nothing it was asked for. The interpreter answers "the
+//! JIT is refused here, and this is what works instead", which is a question
+//! about a PHYSICAL iOS device — where it is still compiled in, and where #188
+//! measured. Android executes emitted code freely (measured: `call` reached
+//! under cranelift on a handset), and a simulator's pages are macOS pages where
+//! RWX is allowed, so neither has the question. There [`PROBE_ORDER`] is simply
+//! the engine's own backend on its own; every consumer reads the order rather
+//! than assuming a length, so such a reply carries no `alternatives` instead of
+//! carrying a wrong one.
+//!
 //! IT IS NOT THE BACKEND THE ENGINE USES, and this probe cannot make it one.
 //! `railgun::circuit::witness::calculate_witness` builds its store with
 //! `Store::default()`, which resolves to cranelift for as long as anything in
@@ -122,6 +139,10 @@ pub enum Backend {
     /// page for a platform to refuse. Present here to be MEASURED, not used:
     /// see this module's docs for why the engine cannot be pointed at it from
     /// this crate.
+    ///
+    /// Absent on Android and on the iOS simulator, where the backend is not in
+    /// the image (#202).
+    #[cfg(not(any(target_os = "android", target_abi = "sim")))]
     Wasmi,
 }
 
@@ -132,6 +153,7 @@ impl Backend {
     pub fn requested(self) -> &'static str {
         match self {
             Backend::EngineDefault => "engine-default",
+            #[cfg(not(any(target_os = "android", target_abi = "sim")))]
             Backend::Wasmi => "wasmi",
         }
     }
@@ -139,6 +161,7 @@ impl Backend {
     fn store(self) -> Store {
         match self {
             Backend::EngineDefault => Store::default(),
+            #[cfg(not(any(target_os = "android", target_abi = "sim")))]
             Backend::Wasmi => Store::new(wasmer::wasmi::Wasmi::new()),
         }
     }
@@ -147,7 +170,18 @@ impl Backend {
 /// Every backend [`probe_all`] measures, in the order it measures them. The
 /// engine's own is LAST: a backend the platform kills the process over ends
 /// the run, and an answer that never arrives is worth less than one that does.
-pub const PROBE_ORDER: [Backend; 2] = [Backend::Wasmi, Backend::EngineDefault];
+///
+/// A slice rather than a fixed-size array because the set is not the same
+/// everywhere: Android and the iOS simulator have no `wasmi` in their image
+/// (#202), so there the order is one entry long and `probe_all` answers about
+/// the engine's backend alone.
+#[cfg(not(any(target_os = "android", target_abi = "sim")))]
+pub const PROBE_ORDER: &[Backend] = &[Backend::Wasmi, Backend::EngineDefault];
+
+/// Where `wasmi` is not compiled in: the engine's own backend, and nothing
+/// beside it. See [`Backend::Wasmi`].
+#[cfg(any(target_os = "android", target_abi = "sim"))]
+pub const PROBE_ORDER: &[Backend] = &[Backend::EngineDefault];
 
 /// What the probe found.
 #[derive(Debug, Clone)]
@@ -320,6 +354,11 @@ mod tests {
     // THE WAY OUT IS REAL CODE, not a plan: the interpreter is in this image
     // and it runs the same wasm to the same answer. A device where the default
     // backend is killed and this one is not is the whole argument for the swap.
+    //
+    // This runs on a desktop, where `wasmi` is always compiled in — the cfg is
+    // what keeps it compiling if these tests are ever built for a target where
+    // it is not (#202).
+    #[cfg(not(any(target_os = "android", target_abi = "sim")))]
     #[test]
     fn the_interpreter_backend_runs_the_same_wasm() {
         let p = probe_backend(Backend::Wasmi);
@@ -339,6 +378,7 @@ mod tests {
     #[test]
     fn the_engines_own_backend_is_probed_last() {
         assert_eq!(*PROBE_ORDER.last().unwrap(), Backend::EngineDefault);
+        assert!(!PROBE_ORDER.is_empty());
         let all = probe_all();
         assert_eq!(all.len(), PROBE_ORDER.len());
         assert_eq!(all.last().unwrap().requested, "engine-default");

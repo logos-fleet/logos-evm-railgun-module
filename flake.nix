@@ -133,8 +133,76 @@
       # output. Exporting one attribute fewer says the same thing to every
       # consumer (`pkgs.web or null`) and works against every pin.
       withoutWeb = targetPkgs: builtins.removeAttrs targetPkgs [ "web" "railgun_module-web" ];
+
+      # ── THE ANDROID CROSS IS A CHECK (#202) ───────────────────────────────
+      #
+      # Nothing used to compile this module for Android. #148 verified all three
+      # mobile targets by hand and then nothing built the Android one again, so
+      # when #188 added a `wasmer` feature whose build script cannot run bindgen
+      # against the NDK sysroot, the break was invisible for as long as nobody
+      # asked a phone for anything: the module's own checks are C++ unit tests it
+      # does not have, and a Bundled set is the only other consumer. It surfaced
+      # on a handset, in a DIFFERENT issue, as `catalog-logos-basecamp-mobile-dev`
+      # refusing to evaluate — a message about a catalog, five derivations away
+      # from the crate that could not compile.
+      #
+      # So the artifact itself is the check. It is the whole Bare image rather
+      # than a `cargo check`: the failure was in a dependency's BUILD SCRIPT,
+      # which only a real cross compile runs, and the Android-only gates that
+      # follow it (the DT_NEEDED soname gate) are worth the same attention.
+      # It needs no device and no NDK of its own, from either machine that can
+      # drive the Android cross:
+      #
+      #   nix build <workspace>#checks.<system>.logos-evm-railgun-module--android-bare
+      #   ws test logos-evm-railgun-module --local logos-evm-railgun-module
+      #
+      # AND IT IS EMPTY UNDER THIS REPO'S OWN flake.lock, on purpose rather than
+      # by neglect. The mobile cross sets are `logos-nix.lib.mkAndroidPkgs` and
+      # friends, which the logos-co logos-module-builder this lock pins does not
+      # carry yet (measured: updating that input changes nothing here), so
+      # `legacyPackages` is `{}` and the filter below yields no systems. A
+      # standalone `nix flake check` therefore has nothing to run, exactly as it
+      # did before — what gained a check is every consumer that supplies the
+      # mobile-capable builder, the workspace among them. Delete the filter and
+      # key on `androidBuildSystems` directly the day a published builder has
+      # them.
+      #
+      # KEYED BY BUILD PLATFORM, not by target: an Android cross derivation's
+      # `system` is the machine building it (x86_64-linux and aarch64-darwin
+      # both can), so this reads `legacyPackages` — the per-build-platform view
+      # — rather than `packages.aarch64-android`, which is pinned to one of them
+      # and cannot be realised on the other. Filtered rather than assumed, for
+      # the same reason `mobileTargets` is: a logos-module-builder pin without
+      # the mobile cross sets leaves this flake with no checks instead of a
+      # `checks` output that fails to evaluate.
+      androidBareCheckSystems = builtins.filter
+        (s: ((module.legacyPackages.${s}.mobile or { }) ? aarch64-android))
+        (builtins.attrNames (module.legacyPackages or { }));
+
+      # ── AND THE SIMULATOR, which was down too and nobody knew ─────────────
+      #
+      # The same `wasmi` bindgen refused `aarch64-ios-simulator` as well, with a
+      # different diagnostic (bindgen's libclang does not know the `-sim`
+      # triple), and that one had gone unnoticed for exactly the same reason: no
+      # Bundled set had yet asked for railgun on a simulator, so nothing built
+      # it. Two of three mobile targets, one root cause, one check each.
+      #
+      # aarch64-darwin only, and not because of the pseudo-system: iOS cross
+      # reaches Xcode through /Applications, so this derivation is `__noChroot`
+      # and exists on a Mac or not at all. That also makes it a check of the
+      # VENUE's Xcode as much as of this crate — which is the right trade here,
+      # since an Xcode that cannot build an iOS module is worth a red test.
+      iosSimBare = (module.packages.aarch64-ios-simulator or { }).bare or null;
     in
     {
+      checks = nixpkgs.lib.genAttrs androidBareCheckSystems (s:
+        {
+          android-bare = module.legacyPackages.${s}.mobile.aarch64-android.bare;
+        }
+        // nixpkgs.lib.optionalAttrs (s == "aarch64-darwin" && iosSimBare != null) {
+          ios-simulator-bare = iosSimBare;
+        });
+
       packages = nixpkgs.lib.genAttrs (systems ++ mobileTargets)
         (target: withoutWeb module.packages.${target});
 

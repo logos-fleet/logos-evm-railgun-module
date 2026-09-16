@@ -29,11 +29,7 @@ url = "2"
 # one crate with one feature set and `witness_engine` measures the SAME backend
 # the engine proves with (#188). If this drifted from ark-circom's request the
 # probe would measure a backend the engine does not use.
-# `"wasmi"` is ADDITIVE and changes nothing about that: `BackendKind::default()`
-# still answers cranelift while `sys-default` is in the set. It puts the pure-Rust
-# interpreter in the image so the probe can measure the way OUT of the JIT on the
-# same device, in the same process.
-wasmer = { version = "6.1", default-features = false, features = ["default", "wasmi"] }
+wasmer = { version = "6.1", default-features = false, features = ["default"] }
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +42,50 @@ tokio = { version = "1", features = ["rt", "time", "net", "io-util", "macros"] }
 
 # Provided by logos-module-builder at build time (staged into ../logos-rust-sdk-src).
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+# ── the interpreter backend, EVERYWHERE THE BINDGEN WORKS ─────────────────────
+# `"wasmi"` is ADDITIVE to the line above and changes nothing about the backend
+# the engine proves with: `BackendKind::default()` still answers cranelift while
+# `sys-default` is in the set. It puts wasmer's pure-Rust interpreter in the
+# image so `witness_engine` can measure the way OUT of the JIT on the same
+# device, in the same process (#188) — the measurement that found iOS kills the
+# process at the JIT's first emitted call.
+#
+# AND IT IS ASKED FOR ONLY WHERE ITS BINDGEN WORKS (#202). wasmer's build script
+# generates the `wasmi` C-API bindings with bindgen, and bindgen is the part of
+# this graph that a Logos cross build does not configure. TWO of the three mobile
+# targets failed on it, each with its own clang diagnostic, and both since #188
+# added the feature:
+#
+#   aarch64-android          bindgen gets `--target aarch64-linux-android` with the
+#                            BUILD platform's nix libcxx headers and no NDK
+#                            sysroot, so libcxx's `platform.h` reaches for a
+#                            `features.h` that is not on the include path:
+#                              ... ClangDiagnostic(... 'features.h' file not found)
+#   aarch64-ios-simulator    bindgen's own libclang rejects the triple outright:
+#                              ... ClangDiagnostic("error: version 'sim' in target
+#                              triple 'arm64-apple-ios-sim' is invalid")
+#
+# The Android one took every Android Bundled set whose closure touches this
+# module's catalog entry down with it — this module is in the mobile catalog, so
+# "whose closure touches it" is not only "which names it" — and the simulator one
+# did the same there, unnoticed, because no set had yet asked for railgun on a
+# simulator.
+#
+# NOTHING IS LOST ON EITHER. The question the interpreter answers is "the JIT is
+# refused here, what works instead", and it is a question about a PHYSICAL iOS
+# device: Android executes emitted code freely (measured — see docs/specs.md:
+# `witness_engine_probe` on a Samsung SM-G990B reaches `call` under cranelift and
+# answers 42), and a simulator's pages are macOS pages where RWX is allowed, so
+# it proves nothing a desktop does not. What remains is `aarch64-apple-ios`,
+# which is exactly where #188 measured, and every desktop — the probe's positive
+# control, which is what makes a handset's answer mean anything.
+#
+# Cargo UNIONS features across these sections, so this is exactly the old line
+# everywhere it is still asked for. Widen the cfg back the day bindgen is given
+# the NDK sysroot and a libclang that knows `-sim`.
+[target.'cfg(not(any(target_os = "android", target_abi = "sim")))'.dependencies]
+wasmer = { version = "6.1", default-features = false, features = ["wasmi"] }
 
 [features]
 default = ["logos_module"]
