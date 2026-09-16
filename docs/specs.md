@@ -504,7 +504,7 @@ LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
   `no configuration for chain 11155111`. `init_defaults()` is idempotent and
   persists, so it is needed on the first launch only.
 
-### `live_send_probe(params_json) → { ok, chainId, eoa, ethWei, tokenUnits, needsFunding, asset, from, to, approveTx, shieldTx, shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
+### `live_send_probe(params_json) → { ok, chainId, eoa, ethWei, tokenUnits, needsFunding, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx, shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
 **The same send with NOTHING substituted: on chain, mined, and accepted by the
 contract** (#213 acceptance clause 1).
 
@@ -518,7 +518,8 @@ verifies the Groth16 proof the device produced.
 | leg | what happens |
 |---|---|
 | `keys` | the probe's own railgun signer + counterparty, from the same fixed seeds `private_send_probe` uses |
-| `funding` | `eth_getBalance` + ERC-20 `balanceOf` for the probe's EOA — the gate, see below |
+| `funding` | `eth_getBalance` + `balanceOf` for the preferred ERC-20 and for the chain's wrapped base token, then [`plan`] decides what to shield — the gate, see below |
+| `wrap` | `deposit()` on the wrapped base token, signed, broadcast, waited on — the probe MINTING the ERC-20 it shields out of its own ETH. Skipped whenever an ERC-20 is already held |
 | `engine` | `RailgunBuilder::build` over a `MemoryDatabase` and the **default** syncer (subsquid, then RPC): the real chain's events, not a syncer we wrote |
 | `approve` | ERC-20 `approve(RailgunSmartWallet, amount)` — signed, broadcast, waited on. Skipped where the allowance already covers it |
 | `shield` | the ENGINE's own `ShieldBuilder` calldata — signed, broadcast, waited on |
@@ -560,17 +561,42 @@ interesting), and nothing of the module's: its own provider over a
 
 `chainId` is deliberately not a parameter for the same reason.
 
+#### The operator ask is SEPOLIA ETH, and nothing else
+
+It used to have two halves — gas, and an ERC-20 to shield — and the second half
+was the expensive one: Sepolia ETH falls out of any faucet, while an arbitrary
+test token has to be found, bridged or minted by hand. It never had to be asked
+for. The chain config already names a token the probe can **mint for itself** —
+`wrapped_base_token`, which on Sepolia is WETH at
+`0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14` — `deposit()` is an ordinary
+transaction this EOA can sign, and RAILGUN shields WETH like any other ERC-20
+(it is the token the engine's own native-shield path uses).
+
+So `plan` (pure, and unit-tested without a chain) decides in this order:
+
+1. no gas → ask, whatever else is held: nothing can be signed without it;
+2. enough of the preferred ERC-20 (`asset`, default Sepolia USDC) → shield that,
+   wrap nothing — so a USDC balance an operator did send is never stranded;
+3. a **named** `asset` that is short → ask, naming it: `deposit()` exists on the
+   wrapped base token and nowhere else, so nothing can be minted for it;
+4. enough of the wrapped base token already → shield that, wrap nothing;
+5. ETH covering gas **and** the shortfall → wrap exactly the shortfall (a second
+   run tops its change up rather than re-minting, so ETH does not leak);
+6. otherwise → ask, in ETH: `MIN_GAS_WEI + DEFAULT_WRAP_SHIELD`
+   = `5100000000000000` wei ≈ **0.0051 ETH** (0.01 is comfortable).
+
 #### Until it is funded, a run is a handoff rather than a crash
 
 The `funding` leg stops the run and reports `needsFunding` — the address, what it
 holds, and what it needs — before an engine is built or anything is signed. The
-address is fixed, so funding it is a one-time operator step: **≥ 0.01 Sepolia ETH**
-for gas and **≥ 1 USDC** at `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` (a run
-shields `100000` units = 0.1 USDC, so 1 USDC is ten runs).
+address is fixed, so funding it is a one-time operator step.
 
 `{ "asset"?: "0x…", "shield"?: "100000", "transfer"?: decimal, "memo"?: string,
 "broadcast"?: bool, "confirmMs"?: u64 }` — all optional, so `live_send_probe()`
-is a complete call. `transfer` defaults to **half of whatever the engine reports
+is a complete call. `shield` defaults **per token**, because one number cannot
+mean the same thing in both: `100000` units (0.1 USDC, 6 decimals) for an ERC-20
+already held, `100000000000000` wei (0.0001 ETH, 18 decimals) for the wrapped
+base token it mints. `transfer` defaults to **half of whatever the engine reports
 as shielded**, which keeps a change note (and so the `01x02` circuit the other
 two probes measured) whatever the RAILGUN shield fee took.
 

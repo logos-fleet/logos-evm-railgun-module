@@ -207,7 +207,10 @@ pub trait RailgunModule: 'static {
     /// cannot sign for an agent (keystore needs a human and a password) and a
     /// probe must never hold anything worth taking. Sepolia only, refused before
     /// any chain read otherwise. Until an operator funds that address every run
-    /// stops at the `funding` leg and reports what to send.
+    /// stops at the `funding` leg and reports what to send — and what to send is
+    /// **Sepolia ETH and nothing else**: with no ERC-20 in hand the probe mints
+    /// its own by wrapping some of its ETH into the chain's wrapped base token
+    /// (`wrap` leg), which RAILGUN shields like any other ERC-20.
     /// See [`crate::live_send`].
     fn live_send_probe(&mut self, params_json: String) -> String;
     /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
@@ -799,7 +802,7 @@ impl RailgunModule for RailgunModuleImpl {
         }
         if let Some(v) = &requested.shield {
             match parse_amount(v) {
-                Ok(v) => params.shield = v,
+                Ok(v) => params.shield = Some(v),
                 Err(e) => return err(e),
             }
         }
@@ -830,6 +833,8 @@ impl RailgunModule for RailgunModuleImpl {
             "tokenUnits": run.token_units.map(|v| v.to_string()),
             "needsFunding": run.needs_funding,
             "asset": run.asset,
+            "wrappedWei": run.wrapped_wei.map(|v| v.to_string()),
+            "wrapTx": run.wrap_tx,
             "from": run.from,
             "to": run.to,
             "approveTx": run.approve_tx,
