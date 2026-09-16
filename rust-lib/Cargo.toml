@@ -23,6 +23,20 @@ alloy = { version = "1.8", default-features = false, features = ["signers"] }
 # `reqwest::Url` is the bundler-URL type PimlicoBundler::new takes; the `url`
 # crate is its re-export — one version in the tree unifies the types.
 url = "2"
+# THE SAME wasmer ark-circom's witness generator runs the circuit under — not a
+# second copy. `default-features = false, features = ["default"]` is verbatim
+# what ark-circom asks for, so cargo unifies the two into one crate with one
+# feature set (`sys-default` → cranelift). `witness_engine` uses it to ask
+# whether emitted code may execute on the device this module is loaded on
+# (#188); if this drifted from ark-circom's request the probe would measure a
+# backend the engine does not use.
+# `"default"` (= `sys-default`) is verbatim what ark-circom asks for, so cargo
+# unifies the two into one crate and the probe measures the SAME backend the
+# engine proves with. `"wasmi"` is ADDITIVE and changes nothing about that:
+# `BackendKind::default()` still answers cranelift while `sys-default` is in the
+# set. It puts the pure-Rust interpreter in the image so the probe can measure
+# the way OUT of the JIT on the same device, in the same process (#188).
+wasmer = { version = "6.1", default-features = false, features = ["default", "wasmi"] }
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

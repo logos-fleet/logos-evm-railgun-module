@@ -152,6 +152,32 @@ signatures are acknowledged and the keystore wipes its copy.
 Give up on a parked relayed send, so it stops occupying the approver's queue. A
 request nobody withdraws is swept by the keystore, but only after a minute.
 
+### `witness_engine_probe() → { ok, requested, backend, reached, answer?, error?, alternatives }`
+**Can this device prove at all?** Every `prepare_transfer` / `prepare_unshield` /
+`relayed_send` needs a Groth16 witness, and the witness comes out of the
+circuit's `.wasm` executed under `wasmer`. Whether that is allowed is a property
+of the platform, not of this module — so it is asked rather than assumed, in the
+same four stages the real witness generator takes:
+
+| `reached` | what completed |
+|---|---|
+| `engine` | the backend exists (`Store::default()`) |
+| `compile` | native code was emitted AND published to executable memory |
+| `instantiate` | memory and imports are wired |
+| `call` | the emitted code RAN and answered — only this proves the engine works |
+
+`ok` is true only for `call` with the right answer. `backend` is what wasmer
+answers (`cranelift`), `requested` is what was asked for. `alternatives` carries
+the same four stages over every other wasm backend in the image (the `wasmi`
+interpreter), so a device that refuses the JIT also says what would work instead.
+Needs no chain, no keys, no artifact download and no shielded balance; safe to
+call before `init`.
+
+A platform may refuse by killing the process rather than returning an error — iOS
+does (#188) — in which case there is no reply at all. Each stage is therefore
+also printed on stderr before it is entered, so a device console still names the
+stage the silence began in.
+
 ## Security model & invariants
 
 1. **Railgun keys never leave the module.** The spending key is a proving witness;
@@ -194,6 +220,56 @@ request nobody withdraws is swept by the keystore, but only after a minute.
 - **No approval event subscription**: a caller polls `relayed_send_status`. The
   keystore announces decisions on its event plane (`approval_settled`), which this
   module could subscribe to instead of being polled — follow-up.
+- **PROVING DOES NOT WORK ON iOS (#188), measured on a device.** The module
+  builds, loads, and answers on a phone — but `prepare_transfer`,
+  `prepare_unshield` and `relayed_send` all need a Groth16 witness, and
+  `ark-circom` produces one by running the circuit's `.wasm` under `wasmer`'s
+  **cranelift JIT**. iOS does not let a third-party app execute code it wrote
+  itself, and it does not refuse politely: it kills the process.
+
+  `witness_engine_probe` is the question asked directly — four stages (`engine`
+  → `compile` → `instantiate` → `call`) over a wasm module carried in this crate,
+  with no chain, keys or artifact download (`rust-lib/src/witness_engine.rs`).
+  Driven through the mobile Shell on a **physical iPad Air (4th generation)**,
+  `--call railgun_module.witness_engine_probe()`:
+
+  ```
+  [shell] call: railgun_module is loaded and answering
+  railgun_module: witness-engine probe [wasmi]: entering engine
+  railgun_module: witness-engine probe [wasmi]: entering compile
+  railgun_module: witness-engine probe [wasmi]: entering instantiate
+  railgun_module: witness-engine probe [wasmi]: entering call
+  railgun_module: witness-engine probe [wasmi]: RAN THE EMITTED CODE (backend=wasmi reached=call answer=Some(42) error=None)
+  railgun_module: witness-engine probe [engine-default]: entering engine
+  railgun_module: witness-engine probe [engine-default]: entering compile
+  railgun_module: witness-engine probe [engine-default]: entering instantiate
+  railgun_module: witness-engine probe [engine-default]: entering call
+  App terminated due to signal 9.
+  ```
+
+  Compiling and publishing the code SUCCEED; the process dies at the instant it
+  enters it — there is no `Err` to report, which is why the stages are narrated.
+  And the line above it is the way out: in the SAME call, in the same process,
+  on the same iPad, wasmer's pure-Rust **`wasmi` interpreter** ran the identical
+  wasm and answered `42`. It emits no machine code, so there is nothing for the
+  platform to refuse. (`wasmi` is probed first for exactly this reason: a
+  backend that gets the process killed takes every later answer with it.)
+
+  **A simulator proves nothing here**: its pages are macOS pages, where RWX is
+  allowed, so the JIT runs there exactly as it does on a desktop.
+
+  **The fix is a backend, not a port — and not one this crate can apply.**
+  `railgun::circuit::witness::calculate_witness` builds its store with
+  `Store::default()`, which resolves to cranelift for as long as anything in the
+  graph asks `wasmer` for `sys-default`; `ark-circom` does, in a third-party
+  fork, and cargo unions features. Pointing the witness generator at `wasmi`
+  means changing `ark-circom` (or adding a witness/store hook to `railgun`)
+  upstream. What is settled here is that the destination works on the device.
+
+  Unaffected: `init` / `init_from_seed` / `get_zk_address` / `sync` /
+  `get_shielded_balance` / `prepare_shield` — the shield path builds unsigned
+  calldata and needs no proof. Android has no such restriction (unmeasured).
+
 - **No `web` (wasm) variant, and not for a reason in this repo (#168).** The flake
   withholds `packages.<system>.web`. What blocks it, measured rather than assumed:
 

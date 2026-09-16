@@ -73,13 +73,25 @@
       # is no `nix.external_libraries` here, so nothing is staged into lib/ as
       # a build-platform image that the builder could not rebuild.
       #
-      # ONE THING IS BUILT AND NOT PROVEN (#188), and it belongs in the record
-      # rather than in a promise: `wasmer`'s cranelift backend is a JIT, and
-      # iOS refuses RWX pages to an app without the dynamic-codesigning
-      # entitlement. The artifact links and passes the Bare gate; whether
-      # `ark-circom` can generate a witness on an iPhone is a RUNTIME question
-      # no one has been able to ask yet, because this module cannot join a
-      # Bundled set (above) and so has never been on a device.
+      # AND ON iOS IT CANNOT PROVE (#188), which is now MEASURED rather than
+      # feared. `wasmer`'s cranelift backend is a JIT and `ark-circom` runs the
+      # circuit under it, so a witness needs the device to execute code the
+      # process wrote itself. On a physical iPad Air (4th gen) the module loads,
+      # answers, builds the engine, compiles and instantiates -- and the process
+      # is killed with SIGKILL at the instant it enters the emitted code:
+      #
+      #   railgun_module: witness-engine probe [engine-default]: entering call
+      #   App terminated due to signal 9.
+      #
+      # `witness_engine_probe` (rust-lib/src/witness_engine.rs) is what asked,
+      # and it asks on any device it is called on. It measures the `wasmi`
+      # interpreter in the same call, which runs the same wasm on the same iPad
+      # to the same answer -- so the way out is a backend swap rather than a
+      # port. It is not one this crate can make: `calculate_witness` builds its
+      # store with `Store::default()`, which answers cranelift for as long as
+      # anything asks wasmer for `sys-default`, and `ark-circom` does. The
+      # artifact here is correct and complete; the shipped SHIELD path (no
+      # proof) works on a phone and transfer/unshield do not. See docs/specs.md.
       #
       # `? ${t}` rather than a bare index, so a logos-module-builder pin without
       # the mobile cross sets leaves this flake simply WITHOUT mobile keys

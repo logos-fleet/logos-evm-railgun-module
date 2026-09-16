@@ -45,6 +45,7 @@ use userop_kit::signable_user_operation::SignableUserOperation;
 use crate::engine::RailgunEngine;
 use crate::relay;
 use crate::rpc_backend::RpcBackend;
+use crate::witness_engine;
 
 pub trait RailgunModule: 'static {
     /// One-time load: `{ "chainId": u64, "spendingKey": hex, "viewingKey": hex,
@@ -93,6 +94,20 @@ pub trait RailgunModule: 'static {
     /// occupying the approver's queue. `{ ok }`. A request nobody withdraws is
     /// swept by the keystore, but only after a minute.
     fn relayed_send_cancel(&mut self, request_id: String) -> String;
+    /// CAN THIS DEVICE PROVE AT ALL?
+    /// `{ ok, requested, backend, reached, answer?, error?, alternatives: [...] }`.
+    /// Every transfer/unshield proof needs a witness, and the witness comes out
+    /// of the circuit's `.wasm` run under `wasmer`'s cranelift JIT — which iOS
+    /// refuses to let execute (#188). This asks that question directly, in four
+    /// stages (`engine` → `compile` → `instantiate` → `call`), over a wasm
+    /// module carried inside this crate: no chain, no keys, no artifact
+    /// download, no shielded balance. `ok: true` only when emitted code ran and
+    /// answered correctly; `reached` says where it stopped otherwise.
+    /// `alternatives` carries the same four stages over every OTHER wasm
+    /// backend in the image (the `wasmi` interpreter), so a device that refuses
+    /// the JIT also says what would work instead. Safe to call before `init`.
+    /// See [`crate::witness_engine`].
+    fn witness_engine_probe(&mut self) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -402,6 +417,29 @@ impl RailgunModule for RailgunModuleImpl {
             }
             None => err("unknown request"),
         }
+    }
+
+    fn witness_engine_probe(&mut self) -> String {
+        fn one(p: &witness_engine::Probe) -> Value {
+            json!({
+                "ok": p.ok(),
+                "requested": p.requested,
+                "backend": p.backend,
+                "reached": p.reached,
+                "answer": p.answer,
+                "error": p.error,
+            })
+        }
+        let all = witness_engine::probe_all();
+        // The engine's own backend is probed LAST and is the headline: `ok`
+        // answers "can THIS device prove", not "can some backend here run
+        // wasm". The rest are the way out, measured beside it.
+        let Some((engine, alternatives)) = all.split_last() else {
+            return err("no wasm backend is compiled into this module");
+        };
+        let mut reply = one(engine);
+        reply["alternatives"] = Value::Array(alternatives.iter().map(one).collect());
+        reply.to_string()
     }
 }
 
