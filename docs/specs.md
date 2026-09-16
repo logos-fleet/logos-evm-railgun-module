@@ -235,6 +235,133 @@ where the JIT kills the process, name `["wasmi"]` alone so the reply survives �
 otherwise each backend's result is still printed on stderr as it completes, for
 the same reason `witness_engine_probe` narrates its stages.
 
+### `proof_circuit_probe(params_json) → { ok, circuit, backend, engineSeam, witnessSource, witnessLen, numInstanceVariables, numWitnessVariables, numConstraints, verified, totalMs, legs, error }`
+**A witness is not a proof — and until this probe, nothing had ever called the
+engine's own witness function on a device.** Two questions, answered by one
+call (#213).
+
+**1. The patched line, RUN rather than merely present.** #188 rewrote one line
+inside `railgun::circuit::witness::calculate_witness` so a physical iOS device
+builds its witness store on wasmer's interpreter instead of a JIT iOS will not
+let it run. `mod circuit` is private at the engine crate's root, so
+`witness_circuit` above could only *replicate* that function — same artifact,
+same `ark_circom::WitnessCalculator`, same backend — and a replica beside a
+patched function proves the patch is in the image, not that it ran.
+`rust-lib/patch-kohaku-engine-seam.sh` opens the smallest seam that fixes it:
+`mod witness;` and `mod remote_artifact_loader;` become `pub(crate)` in the
+vendored `src/circuit/mod.rs`, and `src/lib.rs` gains
+
+```rust
+#[doc(hidden)]
+pub mod logos_engine_seam {
+    pub use crate::circuit::remote_artifact_loader::{RemoteArtifactLoader, RemoteArtifactLoaderError};
+    pub use crate::circuit::witness::{calculate_witness, CalculateWitnessError};
+}
+```
+
+Both items are already `pub`; only the path to them was private, so nothing the
+engine publishes changes. (Not `pub mod circuit;`, which would publish
+`TransactCircuitInputs` and its privately-typed `pub` fields.) The same script
+adds `engine_seam` to this crate's `default` features — `engineSeam` in the
+reply says whether the image carries the pair — so a plain `cargo build`, which
+has no patched vendor directory, still compiles the arm that refuses.
+
+The call prints the patched line, which is the direct evidence of the backend
+the ENGINE chose:
+
+```
+railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+```
+
+`calculate_witness` hard-codes circom's sanity check **ON**, so unlike
+`witness_circuit_probe` this runs the circuit's own assertions over the
+placeholders too. If it ever stops producing a witness, the leg records the
+error and `witness_circuit`'s replica takes over (`witnessSource`:
+`"engine"` | `"probe"`), so the proof is still measured.
+
+**2. What the PROOF costs.** `Groth16Prover::prove_transact` downloads a
+~3.3 MB proving key and ~140 KB of matrices, generates the witness and runs
+arkworks Groth16 over it; RAILGUN quotes "1–2 minutes on mobile" for that, and
+`witness_circuit_probe`'s 817 ms is only the middle of it. The probe runs
+`Groth16Prover::prove`'s tail statement for statement —
+`create_proof_with_reduction_and_matrices` over `[a, b]` with the matrices' own
+`num_instance_variables` / `num_constraints`, then `prepare_verifying_key` +
+`verify_proof` over `witness[1..num_instance]` — and times every leg:
+
+| leg | what |
+|---|---|
+| `proving-key` | fetch + brotli + `ProvingKey::<Bn254>` deserialize; `bytes` is the compressed size |
+| `matrices` | the same, through the engine's own public `SerializableNpIndex` |
+| `engine-wasm` | the ENGINE's `RemoteArtifactLoader::load_wasm`, which also warms its cache |
+| `engine-witness` | the ENGINE's own `calculate_witness` — compute, not network |
+| `probe-witness` | only if the leg above produced nothing: `witness_circuit`'s replica |
+| `prove` | `create_proof_with_reduction_and_matrices` |
+| `verify` | `prepare_verifying_key` + `verify_proof` |
+
+`{ "circuit"?: "01x02" }`; needs the network (~3.5 MB) and no chain, keys or
+shielded balance.
+
+**`verified: false` is the expected answer, and is reported rather than
+hidden.** The inputs are the circuit's real shape filled with placeholders, so
+the constraints are not satisfied. That costs the *timing* nothing — Groth16
+proving is a fixed number of multi-scalar multiplications and FFTs over the
+circuit's matrices, so the milliseconds are a property of the circuit, not of
+the values — and it says nothing about whether a real proof would be accepted,
+which is the chain's business. `ok` therefore means "every leg completed", not
+"the proof verified"; making the verdict the success condition would turn the
+one honest result red.
+
+**MEASURED, on the venue's physical iPad Air (4th generation)**, iOS 26.5.2,
+the shipped release build, in an iOS Bundled set carrying `railgun_module` +
+`eth_rpc_module`, `--call 'railgun_module.proof_circuit_probe(str:{"circuit":"01x02"})'`:
+
+```
+railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+railgun_module: proof-circuit probe 01x02 [wasmi]: PROVED
+  (seam=true witness=Some("engine")/Some(10190) provingKey=Some(1509)ms
+   matrices=Some(744)ms engineWasm=Some(975)ms engineWitness=Some(892)ms
+   prove=Some(383)ms verify=Some(2)ms verified=Some(false) total=4509ms)
+```
+
+| leg | first run | second run | bytes |
+|---|---|---|---|
+| `proving-key` | 1509 ms | 721 ms | 3 341 841 |
+| `matrices` | 744 ms | 363 ms | 141 046 |
+| `engine-wasm` | 975 ms | 487 ms | (891 KB brotli) |
+| `engine-witness` | **892 ms** | **875 ms** | 10 190 signals |
+| `prove` | **383 ms** | **380 ms** | 10 164 constraints |
+| `verify` | 2 ms | 2 ms | |
+| total | 4509 ms | 2831 ms | |
+
+Three things this settles.
+
+**The patched line runs, and it chose the interpreter.** That console line is
+printed from inside the engine's own `calculate_witness`, by the branch #188's
+patch compiled in for physical iOS. It had never appeared on a device before.
+
+**The engine's own witness costs 892 ms** — against `witness_circuit_probe`'s
+817 ms for the replica with the sanity check off. So circom's assertions over
+this circuit are worth about 75 ms, and the replica's number was honest.
+
+**The Groth16 proof is 383 ms, and it is NOT the dominant cost.** RAILGUN
+quotes "1–2 minutes on mobile"; an A14 iPad does the whole compute half —
+witness plus proof plus verify — in about **1.3 s**. What dominates a *first*
+private send is the artifact download (≈3.2 s cold, ≈1.6 s warm, 3.5 MB), which
+is cacheable and is the network's number rather than the device's. A private
+send on iOS needs neither a background job nor a cancel path; a spinner over a
+one-off 3.5 MB fetch is the whole of the UI question.
+
+**A short witness is refused rather than proven over.** `expected_witness_len`
+is ark-circom's own convention, not a guess: its zkey reader sets
+`num_witness_variables = n_vars - n_public`, which counts the constant wire that
+`num_instance_variables = n_public + 1` already counts, while `l_query` — the
+bases the prover's auxiliary MSM runs against — is read at
+`n_vars - n_public - 1`. So a witness is `numInstanceVariables +
+numWitnessVariables - 1` long (10 190 against 6 + 10 185 for `railgun/01x02`),
+and a mismatch is an error instead of a measurement:
+`create_proof_with_reduction_and_matrices` zips the assignment against the
+key's bases, so a short one would otherwise be proven over silently.
+
 ### `web_dependency_probe() → { ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread, callerKind, callerIdentity, callerIsThisModule, legs }`
 **Can this module reach its `web` dependency from a handset?** On a phone
 `keystore_module` is a `web` (wasm) variant — a page in the Shell's container —
@@ -344,6 +471,16 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   artifact source is an upstream-contributable `with_artifact_loader` hook, not a
   fork. Until then, proving (`prepare_transfer`/`prepare_unshield`/`relayed_send`)
   needs network reachability to that source.
+- **A real `prepare_transfer` has still never run on a device (#213).**
+  `proof_circuit_probe` puts a witness through the engine's own
+  `calculate_witness` and a proof through the engine's own arkworks calls, but
+  the input VALUES are placeholders — building a valid one needs a shielded
+  note, a merkle proof over a tree containing it and an EdDSA signature over
+  the public hash, i.e. a funded Sepolia EOA, a mined `prepare_shield` and a
+  `sync` to the tip. That is chain state no probe can fake, and no agent at
+  this venue can obtain testnet funds. What it would add over the numbers
+  above is the verdict (`verified: true`) and the engine's own orchestration
+  around the two calls, not the milliseconds.
 - **Canonical recovery**: `init_from_seed` is not yet RAILGUN-Community BIP-32.
 - **UserOp status**: `relayed_send_status` returns the `userOpHash` once the
   operation is submitted; polling its receipt (`eth_getUserOperationReceipt`) is
@@ -484,6 +621,24 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   Unaffected: `init` / `init_from_seed` / `get_zk_address` / `sync` /
   `get_shielded_balance` / `prepare_shield` — the shield path builds unsigned
   calldata and needs no proof.
+
+- **AND THE PATCHED LINE HAS NOW RUN, on the same device (#213).** #188 could
+  prove the patch was in the iOS image (`strings`) and that the interpreter
+  worked beside it (the probe), but nothing had ever CALLED
+  `calculate_witness` — `mod circuit` is private at the engine crate's root.
+  `rust-lib/patch-kohaku-engine-seam.sh` re-exports it (and the artifact
+  loader) through a `pub mod logos_engine_seam` facade, and
+  `proof_circuit_probe` calls it. On the venue's physical iPad Air (4th gen),
+  release build:
+
+  ```
+  railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+  ```
+
+  followed by a 10 190-signal witness in **892 ms** — the engine's own
+  function, with circom's sanity check ON, on the backend the patch selects.
+  See `proof_circuit_probe` above for the proof that follows it (383 ms) and
+  for the artifact figures.
 
 - **Android has no such restriction, and it is measured now (#202).** The same
   `witness_engine_probe`, on a physical Samsung SM-G990B (Android 16, arm64-v8a),

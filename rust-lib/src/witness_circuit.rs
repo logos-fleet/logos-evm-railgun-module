@@ -43,6 +43,14 @@
 //! that would reject these placeholders. What it CANNOT tell you is whether a
 //! proof verifies — that is `prove_transact`'s business and needs the chain.
 //!
+//! BOTH CLAIMS ARE NOW CHECKED rather than argued (#213).
+//! [`crate::proof_circuit`] calls the ENGINE's own `calculate_witness`, which
+//! runs the same circuit with the sanity check ON, on the same device: 892 ms
+//! against this probe's 817 ms. So the assertions are worth about 75 ms and
+//! the placeholders do not shorten the arithmetic. It also runs the Groth16
+//! proof afterwards (383 ms) — and reports `verified: false`, which is what
+//! the placeholder values cost and the one thing neither probe can fix.
+//!
 //! ## The shape is checked against the circuit, not assumed
 //!
 //! A circom witness calculator does not fail when you feed it too few signals:
@@ -95,7 +103,11 @@ pub const SANITY_CHECK: bool = false;
 /// A placeholder field element. Not 0: a zero input is the one value that can
 /// short-circuit a multiplication chain in a way a real one would not, and it
 /// is also what an unwritten signal already holds.
-const FILLER: u32 = 7;
+///
+/// `pub` because [`crate::proof_circuit`] feeds the ENGINE's own
+/// `calculate_witness` the same placeholders in its own type, and two
+/// different fillers would make the two witnesses incomparable.
+pub const FILLER: u32 = 7;
 
 /// `NNxMM` — the transact circuit for NN nullifiers (notes spent) and MM output
 /// commitments. The engine builds the same name in `Groth16Prover::prove_transact`.
@@ -302,7 +314,7 @@ pub fn run(circuit: &str, backends: &[Backend], wasm: &[u8], url: String, downlo
 /// One backend, announced and reported as it happens — an earlier backend's
 /// number survives a later one's death.
 pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
-    let p = measure(which, circuit, shape, wasm);
+    let (p, _) = measure_witness(which, circuit, shape, wasm);
     eprintln!(
         "railgun_module: witness-circuit probe [{}] {circuit}: {} (backend={} reached={} \
          compile={:?}ms instantiate={:?}ms witness={:?}ms len={:?} nonzero={:?} error={:?})",
@@ -321,8 +333,15 @@ pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -
 }
 
 /// The stages themselves, silent about the outcome: [`probe_backend`] is what
-/// reports it.
-fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
+/// reports it, and is this with the witness dropped — so a caller that needs
+/// the VALUES ([`crate::proof_circuit`] proves over them) and a caller that
+/// needs the measurement can never be reading two different runs.
+pub fn measure_witness(
+    which: Backend,
+    circuit: &str,
+    shape: Shape,
+    wasm: &[u8],
+) -> (Probe, Option<Vec<BigInt>>) {
     entering(which, circuit, stage::ENGINE);
     let mut store = which.store();
     let mut out = Probe {
@@ -344,7 +363,7 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
         Ok(m) => m,
         Err(e) => {
             out.error = Some(format!("compile: {e}"));
-            return out;
+            return (out, None);
         }
     };
     out.compile_ms = Some(t.elapsed().as_millis());
@@ -356,7 +375,7 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
         Ok(w) => w,
         Err(e) => {
             out.error = Some(format!("instantiate: {e}"));
-            return out;
+            return (out, None);
         }
     };
 
@@ -370,14 +389,14 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
              refusing to time a run the circuit would not complete",
             bad.name, bad.expected, bad.declared
         ));
-        return out;
+        return (out, None);
     }
 
     let mut calculator = match WitnessCalculator::new_from_wasm(&mut store, runtime) {
         Ok(c) => c,
         Err(e) => {
             out.error = Some(format!("instantiate: {e}"));
-            return out;
+            return (out, None);
         }
     };
     out.instantiate_ms = Some(t.elapsed().as_millis());
@@ -399,10 +418,13 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
             out.witness_nonzero = Some(w.iter().filter(|v| **v != zero).count());
             out.witness_len = Some(w.len());
             out.reached = stage::WITNESS;
+            (out, Some(w))
         }
-        Err(e) => out.error = Some(format!("witness: {e}")),
+        Err(e) => {
+            out.error = Some(format!("witness: {e}"));
+            (out, None)
+        }
     }
-    out
 }
 
 /// Ask the circuit how big each signal it is about to be fed really is.

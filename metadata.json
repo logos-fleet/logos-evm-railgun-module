@@ -23,7 +23,7 @@
         "runtime": []
       },
       "env": {
-        "postPatch": "bash ./patch-kohaku-witness-backend.sh"
+        "postPatch": "bash ./patch-kohaku-witness-backend.sh && bash ./patch-kohaku-engine-seam.sh"
       }
     },
     "external_libraries": [],

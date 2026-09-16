@@ -44,6 +44,7 @@ use serde_json::{json, Value};
 use userop_kit::signable_user_operation::SignableUserOperation;
 
 use crate::engine::RailgunEngine;
+use crate::proof_circuit;
 use crate::relay;
 use crate::rpc_backend::RpcBackend;
 use crate::web_dependency::{self, Dependency, Leg};
@@ -134,6 +135,32 @@ pub trait RailgunModule: 'static {
     /// device where the JIT kills the process and the reply survives.
     /// See [`crate::witness_circuit`].
     fn witness_circuit_probe(&mut self, params_json: String) -> String;
+    /// AND A WITNESS IS NOT A PROOF — WHAT DOES THE PROOF COST?
+    /// `{ "circuit"?: "01x02" }` →
+    /// `{ ok, circuit, backend, engineSeam, witnessSource, witnessLen,
+    /// numInstanceVariables, numWitnessVariables, numConstraints, verified,
+    /// totalMs, legs: [{ name, ms, bytes, ok, error }], error }`.
+    ///
+    /// [`Self::witness_circuit_probe`] timed the witness (817 ms on an iPad Air
+    /// 4). `Groth16Prover::prove_transact` then downloads a ~3 MB proving key
+    /// and ~140 KB of constraint matrices and runs arkworks Groth16 over that
+    /// witness, and RAILGUN's published "1-2 minutes on mobile" is about THAT
+    /// half. This measures it, leg by leg, over the engine's own artifacts and
+    /// through the same arkworks calls `Groth16Prover::prove` makes (#213).
+    ///
+    /// It also calls the ENGINE'S OWN `calculate_witness` — the function #188's
+    /// build-time patch rewrote and which, until this probe, nothing had ever
+    /// reached on a device (the engine crate's `mod circuit` is private; a
+    /// sibling build-time patch opens a `pub use` seam). The call prints the
+    /// patched line naming the backend it chose, which is the direct evidence
+    /// that the engine's own path takes the interpreter on physical iOS.
+    ///
+    /// Needs the network (~3.5 MB) and no chain, keys or shielded balance: the
+    /// inputs are the circuit's real SHAPE filled with placeholders, so
+    /// `verified` is expected to be `false` and is reported rather than hidden
+    /// — the milliseconds are a property of the circuit, the verdict is a
+    /// property of the values. See [`crate::proof_circuit`].
+    fn proof_circuit_probe(&mut self, params_json: String) -> String;
     /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
     /// `{ ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread,
     /// callerKind, callerIdentity, callerIsThisModule,
@@ -208,6 +235,19 @@ impl RpcBackend for EthRpcBackend {
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
+}
+
+/// A probe's `params_json`, where every field is optional. A `--call` with no
+/// argument arrives as the empty string or as `null`, and both mean "the
+/// defaults" rather than a parse error.
+fn optional_params<T: Default + serde::de::DeserializeOwned>(
+    params_json: &str,
+) -> Result<T, serde_json::Error> {
+    let trimmed = params_json.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(T::default());
+    }
+    serde_json::from_str(trimmed)
 }
 
 /// Parse a dependency's `{ ok, ... }` JSON reply. Anything but an explicit
@@ -492,14 +532,9 @@ impl RailgunModule for RailgunModuleImpl {
             #[serde(default)]
             backends: Option<Vec<String>>,
         }
-        let trimmed = params_json.trim();
-        let params: Params = if trimmed.is_empty() || trimmed == "null" {
-            Params::default()
-        } else {
-            match serde_json::from_str(trimmed) {
-                Ok(p) => p,
-                Err(e) => return err(e),
-            }
+        let params: Params = match optional_params(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
         };
         let circuit = params
             .circuit
@@ -558,6 +593,45 @@ impl RailgunModule for RailgunModuleImpl {
             "wasmBytes": run.wasm_bytes,
             "sanityCheck": witness_circuit::SANITY_CHECK,
             "probes": probes,
+            "error": run.error,
+        })
+        .to_string()
+    }
+
+    fn proof_circuit_probe(&mut self, params_json: String) -> String {
+        #[derive(Deserialize, Default)]
+        struct Params {
+            #[serde(default)]
+            circuit: Option<String>,
+        }
+        let params: Params = match optional_params(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        let circuit = params
+            .circuit
+            .unwrap_or_else(|| witness_circuit::DEFAULT_CIRCUIT.to_string());
+
+        let run = block_on(proof_circuit::run(&circuit));
+        json!({
+            "ok": run.ok(),
+            "circuit": run.circuit,
+            "backend": run.backend,
+            "engineSeam": run.engine_seam,
+            "witnessSource": run.witness_source,
+            "witnessLen": run.witness_len,
+            "numInstanceVariables": run.num_instance_variables,
+            "numWitnessVariables": run.num_witness_variables,
+            "numConstraints": run.num_constraints,
+            "verified": run.verified,
+            "totalMs": run.total_ms,
+            "legs": run.legs.iter().map(|l| json!({
+                "name": l.name,
+                "ms": l.ms,
+                "bytes": l.bytes,
+                "ok": l.ok(),
+                "error": l.error,
+            })).collect::<Vec<Value>>(),
             "error": run.error,
         })
         .to_string()

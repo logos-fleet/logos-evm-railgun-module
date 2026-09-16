@@ -4288,7 +4288,12 @@ name = "railgun_module"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "ark-bn254",
  "ark-circom",
+ "ark-ff 0.6.0",
+ "ark-groth16",
+ "ark-serialize 0.6.0",
+ "ark-std 0.6.0",
  "async-trait",
  "brotli",
  "eip-1193-provider",
@@ -4298,6 +4303,7 @@ dependencies = [
  "railgun",
  "rand 0.9.4",
  "reqwest",
+ "ruint",
  "serde",
  "serde_json",
  "tokio",

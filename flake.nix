@@ -100,6 +100,21 @@
       # `Store::default()` everywhere else. Android JITs freely (#202, measured
       # on a handset), so only the platform that refuses one is diverted.
       #
+      # AND THE PATCHED LINE ITSELF HAS NOW RUN THERE (#213). Until then it was
+      # only provably PRESENT (`strings` over the iOS Bare framework): `mod
+      # circuit` is private at the engine crate's root, so nothing could call
+      # `calculate_witness` and rust-lib/src/witness_circuit.rs could only
+      # replicate it. rust-lib/patch-kohaku-engine-seam.sh -- the second script
+      # on the same `nix.rust.env.postPatch` -- widens two vendored modules to
+      # `pub(crate)` and appends a `pub mod logos_engine_seam` re-exporting
+      # `calculate_witness` and `RemoteArtifactLoader`, and turns on the
+      # `engine_seam` feature that `proof_circuit` is compiled under. On the
+      # venue's physical iPad Air (4th gen) the engine's own function now
+      # announces its backend --
+      #   railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+      # -- and answers a 10 190-signal witness in 892 ms, with the Groth16 proof
+      # after it in 383 ms. See docs/specs.md.
+      #
       # AND THE COST OF THE INTERPRETER IS MEASURED, not assumed:
       # `witness_circuit_probe` times the REAL circuit through the engine's own
       # calculator on each backend in the image. On the venue's physical iPad

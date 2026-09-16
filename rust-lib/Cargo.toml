@@ -43,6 +43,25 @@ wasmer = { version = "6.1", default-features = false, features = ["default"] }
 ark-circom = "0.6"
 num-bigint = "0.4"
 brotli = "8"
+# ── the PROOF after the witness (#213) ──────────────────────────────────────
+# `proof_circuit` runs `Groth16Prover::prove`'s tail -- the proving key, the
+# constraint matrices, `create_proof_with_reduction_and_matrices` and
+# `verify_proof` -- over the witness, because a witness is not a proof and
+# RAILGUN's "1-2 minutes on mobile" is about this half. Every line below is the
+# version the ENGINE asks for, copied from kohaku's workspace Cargo.toml, so
+# cargo unifies them into the crates the engine itself proves with rather than
+# a second set: `ark-groth16` with `default-features = false`, `ark-std` with
+# `getrandom` (the `r`/`s` blinding factors), `ark-serialize` for the two
+# `deserialize_uncompressed_unchecked` calls the engine's artifact loader
+# makes, and `ruint` with the same three features -- `ark-ff-06` is the one
+# that gives `U256 -> ark_ff::BigInt`, which is how the engine turns a witness
+# into field elements.
+ark-bn254 = "0.6"
+ark-ff = "0.6"
+ark-groth16 = { version = "0.6", default-features = false }
+ark-serialize = "0.6"
+ark-std = { version = "0.6", features = ["getrandom"] }
+ruint = { version = "1", features = ["serde", "num-bigint", "ark-ff-06"] }
 # `default-features = false` VERBATIM as the engine asks for it (kohaku's
 # workspace Cargo.toml): cargo unions features, so this adds not one feature to
 # the graph and the probe goes out over the transport the engine already built
@@ -110,6 +129,15 @@ wasmer = { version = "6.1", default-features = false, features = ["wasmi"] }
 [features]
 default = ["logos_module"]
 logos_module = ["dep:logos-rust-sdk"]
+# ── THE ENGINE SEAM, turned on by the build that creates it (#213) ──────────
+# `railgun::circuit` is PRIVATE at the engine crate's root, so nothing outside
+# it can call `calculate_witness` -- the very function #188's build-time patch
+# rewrote. `rust-lib/patch-kohaku-engine-seam.sh` adds a `pub use` facade to
+# the vendored engine source AND adds this feature to `default` above, so the
+# seam and the code that uses it land together or not at all. A plain `cargo
+# build` (which has no patched vendor directory) compiles the other arm of
+# `proof_circuit::engine_witness`, which refuses and says why.
+engine_seam = []
 
 # The engine pins forks of these via the kohaku workspace; an out-of-tree
 # consumer must replicate the patch so the dep graph resolves identically.
