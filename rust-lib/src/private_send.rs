@@ -61,6 +61,27 @@
 //! * NOT PROVED: that the chain would accept it. That needs a mined shield, i.e.
 //!   acceptance clause 1 of #213, which is an operator step and stays open.
 //!
+//! ## THE ANSWER, on the venue's physical iPad Air (4th generation)
+//!
+//! iOS 26.5.2, the shipped release build, in an iOS Bundled set carrying
+//! `railgun_module` + `capability_module`:
+//!
+//! ```text
+//! railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+//! private-send probe: SENT (circuit=01x02 balance=1000000 rootOnChain=false
+//!   calldata=1956B shield=1ms engine=4ms sync=147ms
+//!   transferCold=4382ms transferWarm=1280ms total=5912ms)
+//! ```
+//!
+//! **A private send costs 1.28 s of compute on an A14, and the proof verifies.**
+//! `transfer-warm` — note selection, merkle proof, EdDSA signature, output-note
+//! encryption, the engine's own `calculate_witness` under the interpreter,
+//! Groth16 prove and verify — reproduced within 3 ms across two runs, and lands
+//! on [`crate::proof_circuit`]'s independently measured 892 + 383 + 2 ms. The
+//! two probes agree from opposite ends: placeholder values with the circuit's
+//! real shape, and real values through the engine's own builder. A FIRST send
+//! pays 4.4 s, 3.1 s of which is 3.5 MB of cacheable artifact.
+//!
 //! ## It cannot touch the user's wallet
 //!
 //! The probe builds its OWN [`RailgunProvider`] over a

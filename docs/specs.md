@@ -419,8 +419,56 @@ Needs the network (~3.5 MB of artifacts) and `eth_rpc_module`.
 engine, not its persistence dir, not the user's keys, and nothing written
 anywhere.
 
-**MEASURED on the host** (aarch64-darwin, `cargo test --features engine_seam --
---ignored`, dev profile — a control for the shape, not a number to quote):
+**MEASURED on the venue's physical iPad Air (4th generation)**, iOS 26.5.2, the
+shipped release build, in an iOS Bundled set carrying `railgun_module` +
+`capability_module` (which pulls `eth_rpc_module`; `keystore_module` is
+satisfied by the image's `web` half):
+
+```
+railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+railgun_module: private-send probe: SENT (seam=true chain=11155111
+  circuit=Some("01x02") balance=Some(1000000) rootOnChain=Some(false)
+  calldata=Some(1956)B shield=Some(1)ms engine=Some(4)ms sync=Some(147)ms
+  balanceMs=Some(0) transferCold=Some(4382)ms transferWarm=Some(1280)ms
+  total=5912ms)
+```
+
+| leg | run 1 | run 2 |
+|---|---|---|
+| `shield` (the engine's `encrypt_shield`) | 1 ms | 1 ms |
+| `engine` (build + register) | 4 ms | 5 ms |
+| `sync` (decrypt, insert, real `rootHistory` eth_call) | 147 ms | 98 ms |
+| `balance` | 0 ms | 0 ms |
+| **`transfer-cold`** (artifacts + witness + prove + verify) | **4382 ms** | **3723 ms** |
+| **`transfer-warm`** (compute only) | **1280 ms** | **1283 ms** |
+| `root-on-chain` | 88 ms | 84 ms |
+| total | 5912 ms | 5181 ms |
+
+**A PRIVATE SEND ON AN A14 iPAD COSTS 1.28 s OF COMPUTE, AND THE PROOF
+VERIFIES.** `transfer-warm` is the whole thing with the artifacts already in
+memory — note selection, merkle proof, EdDSA signature, output-note encryption,
+the engine's own `calculate_witness` under `wasmi`, Groth16 prove and verify —
+and it lands within 3 ms of itself across two runs. It also lands on
+`proof_circuit_probe`'s independently measured 892 + 383 + 2 ms ≈ 1.3 s, which
+is the two probes agreeing from opposite ends: placeholder values with the
+circuit's real shape, and real values through the engine's own builder.
+
+RAILGUN quotes "1–2 minutes on mobile". A *first* send pays 4.4 s, and 3.1 s of
+that is 3.5 MB of cacheable artifact; every send after it is 1.3 s. No
+background job, no cancel path — a spinner over a one-off download is the whole
+of the UI question.
+
+The patched line is printed once per transfer, from inside the engine's own
+`calculate_witness`, and on this device it names the interpreter: #188's build-
+time choice, running in the engine's real path rather than a probe's replica.
+
+`rootOnChain: false` is the limit, reported rather than hidden: the root the
+proof was built over is not in the smart wallet's history because no shield was
+mined. Everything above it is real.
+
+**Also measured on the host** (aarch64-darwin, `cargo test --features
+engine_seam -- --ignored`, dev profile — a control for the shape, not a number
+to quote):
 
 ```
 railgun_module: private-send probe: SENT (seam=true chain=11155111
@@ -433,6 +481,28 @@ railgun_module: private-send probe: SENT (seam=true chain=11155111
 One nullifier in, two commitments out — the transfer and the engine's own change
 note — so the circuit is `railgun/01x02`, the same one `proof_circuit_probe`
 measured, and the two are comparable leg for leg.
+
+**Reproducing it on a device**, and two things the Bundled set needs that
+nothing else in this module has ever needed:
+
+```bash
+LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
+  ws run logos-basecamp --target ios-arm64 --app shell \
+     --bundle railgun_module,capability_module \
+     -- --call 'eth_rpc_module.init_defaults()' \
+        --call 'railgun_module.private_send_probe(str:{})'
+```
+
+* **`capability_module` must be in the set.** It is not in this module's
+  `dependencies` and the catalog will not pull it in, but every outbound call
+  goes through it: without it `requestModule` answers an empty token and
+  `eth_rpc_module` rejects the call — `token not recognized (re-exchange
+  failed)`. The earlier probes never called out, so this is the first time it
+  showed. Any Bundled set whose members talk to each other wants it named.
+* **`eth_rpc_module` needs seeding once per device.** A device that has never
+  run the wallet has no chain records, and the engine's sync fails with
+  `no configuration for chain 11155111`. `init_defaults()` is idempotent and
+  persists, so it is needed on the first launch only.
 
 ### `web_dependency_probe() → { ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread, callerKind, callerIdentity, callerIsThisModule, legs }`
 **Can this module reach its `web` dependency from a handset?** On a phone
