@@ -15,6 +15,8 @@
 //!
 //! ```text
 //!   funding   how much ETH and ERC-20 the probe's own EOA holds, read off chain
+//!   wrap      `deposit()` on the chain's wrapped base token, so ETH alone is
+//!             enough to fund a run -- skipped when an ERC-20 is already held
 //!   engine    RailgunBuilder over the DEFAULT syncer (subsquid, then RPC) --
 //!             i.e. the real Sepolia tree, not a syncer we wrote
 //!   approve   ERC-20 approve(RailgunSmartWallet, amount), SIGNED AND BROADCAST
@@ -53,10 +55,18 @@
 //! never touches the module's engine, the user's keys or the module's
 //! persistence. Fund it with testnet dust and nothing else.
 //!
-//! ## What an operator has to do, once
+//! ## What an operator has to do, once: SEND SEPOLIA ETH. That is the whole ask.
 //!
-//! Send Sepolia ETH for gas and the ERC-20 to shield to the address this probe
-//! prints. Until then every run stops at the `funding` leg and reports the ask,
+//! The ask used to have two halves -- gas, and an ERC-20 to shield -- and the
+//! second half was the expensive one: Sepolia ETH falls out of any faucet, while
+//! an arbitrary test token has to be found, bridged or minted by hand. It never
+//! had to be asked for. The chain config already names a token this probe can
+//! MINT for itself (`wrapped_base_token`, i.e. WETH), `deposit()` is an ordinary
+//! transaction this EOA can sign, and RAILGUN shields WETH like any other ERC-20
+//! -- it is the token the engine's own native-shield path uses. So [`plan`]
+//! wraps what it needs and an ERC-20 the EOA already holds is merely preferred.
+//!
+//! Until the ETH lands every run stops at the `funding` leg and reports the ask,
 //! which is a complete handoff rather than a failure: the address is fixed, so
 //! the funding is a one-time step and every later run is unattended.
 
@@ -89,6 +99,12 @@ alloy::sol! {
     function allowance(address owner, address spender) external view returns (uint256);
     function approve(address spender, uint256 value) external returns (bool);
     function rootHistory(uint256 treeNumber, bytes32 root) external view returns (bool);
+    /// WETH9's `deposit()` -- how the probe MINTS the ERC-20 it shields, out of
+    /// the ETH it was funded with. The chain config's `wrapped_base_token` is
+    /// that contract (Sepolia: `0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14`,
+    /// symbol `WETH`, 18 decimals), and RAILGUN shields it like any other
+    /// ERC-20 -- it is the token the engine's own native-shield path uses.
+    function deposit() external payable;
 }
 
 /// THE PROBE'S OWN EOA. Public by construction — see the module docs — and
@@ -107,6 +123,13 @@ pub const SEPOLIA_USDC: &str = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
 /// (0.1 USDC at 6 decimals). Proof cost does not depend on the value, so this is
 /// as small as it can be while still splitting into a transfer and a change note.
 pub const DEFAULT_SHIELD: u128 = 100_000;
+
+/// How much of the WRAPPED BASE TOKEN one run shields when the probe mints its
+/// own (18 decimals, so `0.0001 ETH`). Proof cost does not depend on the value,
+/// so this is as small as it can be and still survive RAILGUN's 25 bps shield
+/// fee with a change note left over -- which is what keeps the operation on the
+/// `01x02` circuit the other two probes measured.
+pub const DEFAULT_WRAP_SHIELD: u128 = 100_000_000_000_000;
 
 /// Gas the probe wants to see before it starts spending: a shield is ~250 k gas
 /// and a `transact` ~1.5 M, so at Sepolia's usual few gwei this is generous.
@@ -128,9 +151,16 @@ pub fn probe_eoa_address() -> Address {
 #[derive(Debug, Clone)]
 pub struct Params {
     pub chain_id: u64,
-    /// The ERC-20 to shield and transfer. `None` = [`SEPOLIA_USDC`].
+    /// The ERC-20 to shield and transfer. Naming one also says "shield THIS and
+    /// nothing else": the probe will not wrap for a named asset, because the
+    /// only ERC-20 it can mint is the chain's wrapped base token. `None` lets
+    /// [`plan`] choose, and is what makes a run need nothing but ETH.
     pub asset: Option<Address>,
-    pub shield: u128,
+    /// How much to shield, in the chosen token's smallest unit. `None` =
+    /// [`DEFAULT_SHIELD`] for an ERC-20 the EOA already holds and
+    /// [`DEFAULT_WRAP_SHIELD`] for the 18-decimal wrapped base token, since one
+    /// number cannot mean the same thing in both.
+    pub shield: Option<u128>,
     /// `None` = half of whatever the engine reports as shielded, which keeps the
     /// operation at one nullifier and two commitments (`01x02`) whatever the
     /// shield fee took.
@@ -150,7 +180,7 @@ impl Default for Params {
         Self {
             chain_id: SEPOLIA,
             asset: None,
-            shield: DEFAULT_SHIELD,
+            shield: None,
             transfer: None,
             memo: "#213 live-send probe".to_string(),
             broadcast: true,
@@ -172,6 +202,10 @@ pub struct Run {
     /// What an operator has to do, in one sentence, when the answer is "fund it".
     pub needs_funding: Option<String>,
     pub asset: Option<String>,
+    /// Wei of the EOA's own ETH turned into the wrapped base token, and the
+    /// transaction that did it. `None` = the EOA already held an ERC-20.
+    pub wrapped_wei: Option<u128>,
+    pub wrap_tx: Option<String>,
     /// The probe's `0zk` address and the counterparty's.
     pub from: Option<String>,
     pub to: Option<String>,
@@ -209,6 +243,121 @@ impl Run {
         report(&self);
         self
     }
+}
+
+// ── what to shield, and where it comes from ───────────────────────────
+
+/// An ERC-20 and what the probe's EOA holds of it, in that token's own
+/// smallest unit -- which is not the same unit twice, see [`DEFAULT_SHIELD`]
+/// and [`DEFAULT_WRAP_SHIELD`].
+#[derive(Debug, Clone, Copy)]
+pub struct Holding {
+    pub token: Address,
+    pub units: u128,
+}
+
+/// Everything the funding decision looks at. A struct rather than four
+/// arguments because [`plan`] is the one part of this probe that has to be
+/// right without a chain to check it against.
+#[derive(Debug, Clone)]
+pub struct Purse {
+    pub eoa: Address,
+    pub wei: u128,
+    /// The ERC-20 the run prefers, and how much of it the EOA holds.
+    pub erc20: Holding,
+    /// The chain's wrapped base token and the EOA's balance of it -- the one
+    /// ERC-20 this probe can MINT, out of its own ETH. `None` when the caller
+    /// named an asset: then there is nothing to mint and a short balance is an
+    /// ask.
+    pub wrapped: Option<Holding>,
+}
+
+/// What the probe will shield. `wrap` is the wei of the EOA's own ETH to turn
+/// into `token` first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub token: Address,
+    pub shield: u128,
+    pub wrap: Option<u128>,
+}
+
+/// THE OPERATOR ASK, REDUCED TO ONE ASSET. Three #213 cycles stopped on funding,
+/// and the ERC-20 half was the expensive half: Sepolia ETH falls out of any
+/// faucet, while an arbitrary test token has to be found, bridged or minted by
+/// hand. It never had to be asked for -- the chain config already names a token
+/// the probe can mint for itself (`wrapped_base_token`, i.e. WETH), a `deposit()`
+/// is an ordinary transaction this EOA can sign, and RAILGUN shields WETH like
+/// any other ERC-20. So ETH alone is now enough, and an ERC-20 the EOA already
+/// holds is still preferred when it is there.
+///
+/// Pure, and ordered so the answer is never surprising:
+///
+/// 1. no gas -> ask, whatever else is held (nothing can be signed without it);
+/// 2. enough of the preferred ERC-20 -> shield that, wrap nothing;
+/// 3. a named asset that is short -> ask, naming it (nothing to mint);
+/// 4. enough of the wrapped base token already -> shield that, wrap nothing;
+/// 5. ETH to cover gas AND the shortfall -> wrap the shortfall;
+/// 6. otherwise -> ask, in ETH.
+pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
+    // What a run would shield out of each source. One number cannot serve both:
+    // the preferred ERC-20 is a 6-decimal stablecoin and the wrapped base token
+    // is 18-decimal ETH.
+    let want_erc20 = asked.unwrap_or(DEFAULT_SHIELD);
+    let want_wrapped = asked.unwrap_or(DEFAULT_WRAP_SHIELD);
+    // The wei a `wrap` leg would mint with, and so the one number an ask is:
+    // gas, plus whatever the wrapped balance is short of a shield. Zero when
+    // there is nothing to mint, which is what a named `asset` means.
+    let shortfall = purse.wrapped.map_or(0, |w| want_wrapped.saturating_sub(w.units));
+    let full_ask = MIN_GAS_WEI.saturating_add(shortfall);
+
+    let ask = || {
+        let (held, mint) = match purse.wrapped {
+            Some(w) => (
+                format!(
+                    "{} units of {} and {} units of {}",
+                    purse.erc20.units, purse.erc20.token, w.units, w.token
+                ),
+                format!(
+                    " ETH is ALL it needs: it mints its own ERC-20 by wrapping {shortfall} wei of \
+                     it into the chain's wrapped base token ({}) and shielding that.",
+                    w.token
+                ),
+            ),
+            None => (
+                format!("{} units of {}", purse.erc20.units, purse.erc20.token),
+                format!(
+                    " This run named an asset ({}), and the only ERC-20 this probe can mint for \
+                     itself is the chain's wrapped base token -- so send that token too, or leave \
+                     `asset` unset.",
+                    purse.erc20.token
+                ),
+            ),
+        };
+        format!(
+            "fund {} on Sepolia with at least {full_ask} wei of ETH: it holds {} wei and \
+             {held}.{mint} That address is FIXED (it is derived from a seed in \
+             rust-lib/src/live_send.rs), so this is a one-time step -- every run after it is \
+             unattended.",
+            purse.eoa, purse.wei
+        )
+    };
+
+    if purse.wei < MIN_GAS_WEI {
+        return Err(ask());
+    }
+    if purse.erc20.units >= want_erc20 {
+        return Ok(Plan { token: purse.erc20.token, shield: want_erc20, wrap: None });
+    }
+    let Some(wrapped) = purse.wrapped else {
+        return Err(ask());
+    };
+    if wrapped.units >= want_wrapped {
+        return Ok(Plan { token: wrapped.token, shield: want_wrapped, wrap: None });
+    }
+    if purse.wei >= full_ask {
+        return Ok(Plan { token: wrapped.token, shield: want_wrapped, wrap: Some(shortfall) });
+    }
+    Err(ask())
 }
 
 /// Announce a stage BEFORE entering it: on a platform that kills the process
@@ -349,6 +498,25 @@ fn sign_1559(key: &SigningKey, tx: TxEip1559) -> Result<(Signature, Vec<u8>), St
     Ok((signature, tx.into_signed(signature).encoded_2718()))
 }
 
+/// MINT THE PROBE'S OWN ERC-20: `deposit()` on the chain's wrapped base token,
+/// paid for with `amount` wei of the EOA's own ETH. Split out of [`run`] so a
+/// test can decode the signed transaction it produces without a chain -- the
+/// destination, the value and the selector are the whole of this leg, and
+/// getting any of the three wrong spends real gas to find out.
+async fn wrap_native<B: RpcBackend>(
+    eoa: &Eoa<B>,
+    wrapped: Address,
+    amount: u128,
+    budget: Duration,
+) -> Result<(String, u64), String> {
+    let value = U256::from(amount);
+    let data: Bytes = depositCall {}.abi_encode().into();
+    let gas = eoa.gas_limit(wrapped, value, &data)?;
+    let tx = eoa.send(wrapped, value, data, gas)?;
+    let block = eoa.wait(&tx, budget).await?;
+    Ok((tx, block))
+}
+
 // ── the run ─────────────────────────────────────────────────────────────────
 
 /// THE WHOLE THING, on the real chain.
@@ -372,12 +540,13 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
         return out.finished(started);
     };
     let smart_wallet = chain.railgun_smart_wallet;
-    let token = match p.asset {
-        Some(a) => a,
-        None => SEPOLIA_USDC.parse().expect("the fixture token address is a literal"),
-    };
-    let asset = AssetId::erc20(token);
-    out.asset = Some(asset.to_string());
+    // The ERC-20 the run prefers, and the one it can mint. Naming an asset
+    // turns the second off: `deposit()` exists on the wrapped base token and
+    // nowhere else.
+    let preferred = p
+        .asset
+        .unwrap_or_else(|| SEPOLIA_USDC.parse().expect("the fixture token address is a literal"));
+    let mintable = p.asset.is_none().then_some(chain.wrapped_base_token);
 
     let eip1193: Arc<dyn Eip1193Provider> = Arc::new(EthRpcEip1193::new(backend.clone()));
     let eoa = Eoa::new(backend.clone(), p.chain_id);
@@ -407,37 +576,70 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     // ── can this account pay for what follows? ─────────────────────────────
     entering("funding");
     let t = Instant::now();
-    let funding: Result<(u128, u128), String> = async {
+    let held = |token: Address| {
+        let eip1193 = eip1193.clone();
+        async move {
+            let units: U256 = eip1193
+                .sol_call(token, balanceOfCall { owner: eoa.address })
+                .await
+                .map_err(|e| format!("balanceOf {token}: {e}"))?;
+            Ok::<u128, String>(u128::try_from(units).unwrap_or(u128::MAX))
+        }
+    };
+    let purse: Result<Purse, String> = async {
         let wei = eoa.eth_balance()?;
-        let units: U256 = eip1193
-            .sol_call(token, balanceOfCall { owner: eoa.address })
-            .await
-            .map_err(|e| format!("balanceOf: {e}"))?;
-        Ok((wei, u128::try_from(units).unwrap_or(u128::MAX)))
+        let erc20 = Holding { token: preferred, units: held(preferred).await? };
+        let wrapped = match mintable {
+            Some(token) => Some(Holding { token, units: held(token).await? }),
+            None => None,
+        };
+        Ok(Purse { eoa: eoa.address, wei, erc20, wrapped })
     }
     .await;
-    let (wei, units) = match funding {
+    let purse = match purse {
         Ok(v) => v,
         Err(e) => {
             out.legs.push(Leg::failed("funding", Some(t.elapsed().as_millis()), e));
             return out.finished(started);
         }
     };
-    out.eth_wei = Some(wei);
-    out.token_units = Some(units);
-    if wei < MIN_GAS_WEI || units < p.shield {
-        let ask = format!(
-            "fund {} on Sepolia: it holds {} wei of ETH and {} units of {}, and needs at least {} \
-             wei for gas and {} units to shield. That address is FIXED (it is derived from a seed \
-             in rust-lib/src/live_send.rs), so this is a one-time step -- every run after it is \
-             unattended.",
-            eoa.address, wei, units, token, MIN_GAS_WEI, p.shield
-        );
-        out.needs_funding = Some(ask.clone());
-        out.legs.push(Leg::failed("funding", Some(t.elapsed().as_millis()), ask));
-        return out.finished(started);
-    }
+    out.eth_wei = Some(purse.wei);
+    let chosen = match plan(&purse, p.shield) {
+        Ok(chosen) => chosen,
+        Err(ask) => {
+            out.token_units = Some(purse.erc20.units);
+            out.needs_funding = Some(ask.clone());
+            out.legs.push(Leg::failed("funding", Some(t.elapsed().as_millis()), ask));
+            return out.finished(started);
+        }
+    };
+    let token = chosen.token;
+    let shield_units = chosen.shield;
+    let asset = AssetId::erc20(token);
+    out.asset = Some(asset.to_string());
+    out.token_units = Some(if token == purse.erc20.token {
+        purse.erc20.units
+    } else {
+        purse.wrapped.map_or(0, |w| w.units)
+    });
     out.legs.push(Leg::timed("funding", Some(t.elapsed().as_millis())));
+
+    // ── mint what is missing, out of the probe's own ETH ─────────────────
+    if let Some(amount) = chosen.wrap {
+        entering("wrap");
+        let t = Instant::now();
+        out.wrapped_wei = Some(amount);
+        match wrap_native(&eoa, token, amount, Duration::from_millis(p.confirm_ms)).await {
+            Ok((tx, _)) => {
+                out.wrap_tx = Some(tx);
+                out.legs.push(Leg::timed("wrap", Some(t.elapsed().as_millis())));
+            }
+            Err(e) => {
+                out.legs.push(Leg::failed("wrap", Some(t.elapsed().as_millis()), e));
+                return out.finished(started);
+            }
+        }
+    }
 
     // ── the engine, over the REAL syncer and the real tree ─────────────────
     entering("engine");
@@ -467,10 +669,10 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             .sol_call(token, allowanceCall { owner: eoa.address, spender: smart_wallet })
             .await
             .map_err(|e| format!("allowance: {e}"))?;
-        if current >= U256::from(p.shield) {
+        if current >= U256::from(shield_units) {
             return Ok(None);
         }
-        let data: Bytes = approveCall { spender: smart_wallet, value: U256::from(p.shield) }
+        let data: Bytes = approveCall { spender: smart_wallet, value: U256::from(shield_units) }
             .abi_encode()
             .into();
         let gas = eoa.gas_limit(token, U256::ZERO, &data)?;
@@ -498,7 +700,7 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     let t = Instant::now();
     let shield = provider
         .shield()
-        .shield(from.clone(), asset, p.shield)
+        .shield(from.clone(), asset, shield_units)
         .build(&mut rand::rng())
         .map_err(|e| format!("build shield: {e}"))
         .and_then(|txs| {
@@ -680,9 +882,9 @@ pub fn report(r: &Run) {
     let leg = |n: &str| r.leg(n).and_then(|l| l.ms);
     eprintln!(
         "railgun_module: live-send probe: {} (chain={} eoa={:?} circuit={:?} shielded={:?} \
-         transferred={:?} rootOnChain={:?} shieldTx={:?} transferTx={:?} calldata={:?}B \
-         funding={:?}ms engine={:?}ms approve={:?}ms shield={:?}ms sync={:?}ms balance={:?}ms \
-         transfer={:?}ms broadcast={:?}ms total={}ms)",
+         transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} shieldTx={:?} \
+         transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms approve={:?}ms \
+         shield={:?}ms sync={:?}ms balance={:?}ms transfer={:?}ms broadcast={:?}ms total={}ms)",
         if r.ok() { "SENT" } else { "DID NOT" },
         r.chain_id,
         r.eoa,
@@ -690,10 +892,13 @@ pub fn report(r: &Run) {
         r.balance,
         r.transferred,
         r.root_on_chain,
+        r.asset,
+        r.wrapped_wei,
         r.shield_tx,
         r.transfer_tx,
         r.calldata_bytes,
         leg("funding"),
+        leg("wrap"),
         leg("engine"),
         leg("approve"),
         leg("shield"),
@@ -724,7 +929,7 @@ mod tests {
     #[derive(Default)]
     struct Canned {
         answers: Mutex<HashMap<String, Value>>,
-        seen: Mutex<Vec<String>>,
+        seen: Mutex<Vec<(String, Value)>>,
     }
 
     impl Canned {
@@ -740,13 +945,18 @@ mod tests {
         }
 
         fn asked(&self) -> Vec<String> {
-            self.seen.lock().unwrap().clone()
+            self.seen.lock().unwrap().iter().map(|(m, _)| m.clone()).collect()
+        }
+
+        /// The params of the first call to `method`.
+        fn params(&self, method: &str) -> Option<Value> {
+            self.seen.lock().unwrap().iter().find(|(m, _)| m == method).map(|(_, p)| p.clone())
         }
     }
 
     impl RpcBackend for Canned {
-        fn rpc(&self, method: &str, _params: Value) -> Result<Value, String> {
-            self.seen.lock().unwrap().push(method.to_string());
+        fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+            self.seen.lock().unwrap().push((method.to_string(), params));
             self.answers
                 .lock()
                 .unwrap()
@@ -767,6 +977,25 @@ mod tests {
     /// A 32-byte word, as an `eth_call` answers one.
     fn word(n: u128) -> Value {
         json!(format!("0x{n:064x}"))
+    }
+
+    /// Whom a node would bill for this transaction: recovered from the
+    /// signature over the signing hash, exactly as a node does it. Alloy's own
+    /// `recover_signer` needs a feature this crate does not ask for, and doing
+    /// it by hand is what makes the answer independent of the code under test.
+    fn sender(tx: &TxEip1559, signature: &Signature) -> Address {
+        use alloy::signers::k256::ecdsa::VerifyingKey;
+
+        let recid = RecoveryId::from_byte(u8::from(signature.v())).expect("parity");
+        let sig = alloy::signers::k256::ecdsa::Signature::from_scalars(
+            signature.r().to_be_bytes::<32>(),
+            signature.s().to_be_bytes::<32>(),
+        )
+        .expect("scalars");
+        let recovered =
+            VerifyingKey::recover_from_prehash(tx.signature_hash().as_slice(), &sig, recid)
+                .expect("recover");
+        alloy::signers::utils::public_key_to_address(&recovered)
     }
 
     // THE ADDRESS AN OPERATOR FUNDS. It is a constant of this file, so it is
@@ -809,7 +1038,11 @@ mod tests {
         assert_eq!(out.eoa, Some(probe_eoa_address().to_string()));
         let ask = out.needs_funding.expect("an unfunded run must say what it needs");
         assert!(ask.contains(&probe_eoa_address().to_string()), "{ask}");
-        assert!(ask.contains(&MIN_GAS_WEI.to_string()), "{ask}");
+        assert!(
+            ask.contains(&(MIN_GAS_WEI + DEFAULT_WRAP_SHIELD).to_string()),
+            "the ask must be ONE number in ETH -- gas plus what it wraps: {ask}"
+        );
+        assert!(ask.contains("wrapping"), "and it must say ETH is all it needs: {ask}");
         assert_eq!(
             out.legs.iter().map(|l| l.name).collect::<Vec<_>>(),
             vec!["keys", "funding"],
@@ -818,18 +1051,116 @@ mod tests {
         assert!(!chain.asked().iter().any(|m| m == "eth_sendRawTransaction"));
     }
 
-    // Gas but no token is still unfunded, and the ask carries both numbers —
-    // the venue has already funded one of the two halves once.
+    // ── the funding decision, which is the whole of the operator ask ───────
+
+    fn purse(wei: u128, erc20: u128, wrapped: Option<u128>) -> Purse {
+        Purse {
+            eoa: probe_eoa_address(),
+            wei,
+            erc20: Holding { token: SEPOLIA_USDC.parse().unwrap(), units: erc20 },
+            wrapped: wrapped
+                .map(|units| Holding { token: ChainConfig::sepolia().wrapped_base_token, units }),
+        }
+    }
+
+    // #213's THIRD BLOCKER, REMOVED. For three cycles the run stopped because
+    // the EOA held no ERC-20, and an arbitrary test token is the half of the ask
+    // an operator cannot satisfy from a faucet. It never had to be asked for:
+    // the chain config names a token the probe can MINT out of its own ETH.
     #[test]
-    fn gas_without_the_token_is_still_a_funding_ask() {
+    fn eth_alone_is_enough_because_the_probe_mints_its_own_erc20() {
+        let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(0)), None)
+            .expect("a well-funded-in-ETH account is not a funding ask any more");
+        assert_eq!(chosen.token, ChainConfig::sepolia().wrapped_base_token);
+        assert_eq!(chosen.shield, DEFAULT_WRAP_SHIELD);
+        assert_eq!(chosen.wrap, Some(DEFAULT_WRAP_SHIELD), "it has to mint the whole amount");
+    }
+
+    // And an ERC-20 that is already there is still preferred, so the 20 USDC the
+    // venue funded once are not stranded by this.
+    #[test]
+    fn an_erc20_the_eoa_already_holds_beats_wrapping() {
+        let chosen = plan(&purse(MIN_GAS_WEI * 4, DEFAULT_SHIELD, Some(0)), None).expect("funded");
+        assert_eq!(chosen.token, SEPOLIA_USDC.parse::<Address>().unwrap());
+        assert_eq!(chosen.wrap, None, "it wrapped ETH it did not need to");
+    }
+
+    // Wrapping only covers the SHORTFALL: a second run on the same EOA leaves
+    // change behind, and spending ETH to re-mint it would be a slow leak.
+    #[test]
+    fn a_partial_wrapped_balance_is_topped_up_not_replaced() {
+        let held = DEFAULT_WRAP_SHIELD / 4;
+        let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(held)), None).expect("funded");
+        assert_eq!(chosen.wrap, Some(DEFAULT_WRAP_SHIELD - held));
+        let enough = plan(&purse(MIN_GAS_WEI * 4, 0, Some(DEFAULT_WRAP_SHIELD)), None).unwrap();
+        assert_eq!(enough.wrap, None);
+    }
+
+    // Gas alone, with no room to wrap, is still an ask — and the number in it is
+    // gas PLUS the wrap, because asking for exactly the gas would strand the run
+    // one leg later.
+    #[test]
+    fn gas_with_no_room_to_wrap_is_a_funding_ask() {
+        let err = plan(&purse(MIN_GAS_WEI, 0, Some(0)), None).expect_err("it cannot shield");
+        assert!(err.contains(&(MIN_GAS_WEI + DEFAULT_WRAP_SHIELD).to_string()), "{err}");
+    }
+
+    // Nothing is minted for a NAMED asset: `deposit()` is on the wrapped base
+    // token and nowhere else, so a caller who names a token has to bring it.
+    #[test]
+    fn a_named_asset_is_never_wrapped() {
+        let err = plan(&purse(MIN_GAS_WEI * 4, 0, None), None).expect_err("it holds none of it");
+        assert!(err.contains("named an asset"), "{err}");
+        assert!(!err.contains("mints its own"), "{err}");
+    }
+
+    // No gas is an ask whatever else is held: nothing here can be signed without
+    // it, so reporting a token balance as if it were progress would mislead.
+    #[test]
+    fn no_gas_is_an_ask_even_with_the_token_in_hand() {
+        let err = plan(&purse(0, DEFAULT_SHIELD * 100, Some(DEFAULT_WRAP_SHIELD)), None)
+            .expect_err("it cannot pay for a transaction");
+        assert!(err.contains(&MIN_GAS_WEI.to_string()), "{err}");
+    }
+
+    // THE WRAP ITSELF. Destination, value and selector are the whole leg and all
+    // three are invisible until gas has been spent, so they are read back out of
+    // the SIGNED transaction rather than out of the arguments that made it.
+    #[test]
+    fn the_wrap_is_a_deposit_on_the_chains_wrapped_base_token() {
+        use alloy::consensus::TxEnvelope;
+        use alloy::eips::eip2718::Decodable2718;
+
+        let wrapped = ChainConfig::sepolia().wrapped_base_token;
         let chain = Canned::with(&[
-            ("eth_getBalance", json!(format!("0x{:x}", MIN_GAS_WEI * 2))),
-            ("eth_call", word(1)), // one unit, far short of a shield
+            ("eth_getTransactionCount", json!("0x3")),
+            ("eth_gasPrice", json!("0x3b9aca00")),
+            ("eth_estimateGas", json!("0xb16a")),
+            ("eth_sendRawTransaction", json!("0xwrapped")),
+            ("eth_getTransactionReceipt", json!({ "status": "0x1", "blockNumber": "0x7b" })),
         ]);
-        let out = block_on(run(chain, Params::default()));
-        let ask = out.needs_funding.expect("short of tokens is short");
-        assert!(ask.contains(&DEFAULT_SHIELD.to_string()), "{ask}");
-        assert_eq!(out.token_units, Some(1));
+        let eoa = Eoa::new(chain.clone(), SEPOLIA);
+        let (tx, block) =
+            block_on(wrap_native(&eoa, wrapped, DEFAULT_WRAP_SHIELD, Duration::from_millis(1)))
+                .expect("wrap");
+        assert_eq!((tx.as_str(), block), ("0xwrapped", 123));
+
+        let raw = chain.params("eth_sendRawTransaction").expect("it never sent anything");
+        let raw = raw[0].as_str().expect("a raw transaction is a hex string");
+        let bytes = hex::decode(raw.trim_start_matches("0x")).expect("hex");
+        let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).expect("a 2718 envelope");
+        let signed = envelope.as_eip1559().expect("EIP-1559");
+        assert_eq!(signed.tx().to, TxKind::Call(wrapped), "it wrapped at the wrong contract");
+        assert_eq!(signed.tx().value, U256::from(DEFAULT_WRAP_SHIELD), "wrong value");
+        // `deposit()` — WETH9's payable mint. A wrong selector would pay ETH into
+        // the contract's fallback, which on WETH9 happens to be deposit() anyway;
+        // on anything else it is a donation.
+        assert_eq!(hex::encode(&signed.tx().input), "d0e30db0");
+        assert_eq!(
+            sender(signed.tx(), signed.signature()),
+            probe_eoa_address(),
+            "the wrap has to come from the account an operator funded"
+        );
     }
 
     // The signature is the one thing here that no chain checks for us before it
@@ -838,8 +1169,6 @@ mod tests {
     // spend.
     #[test]
     fn a_signed_transaction_recovers_to_the_probes_own_address() {
-        use alloy::signers::k256::ecdsa::VerifyingKey;
-
         let tx = TxEip1559 {
             chain_id: SEPOLIA,
             nonce: 7,
@@ -851,20 +1180,8 @@ mod tests {
             access_list: AccessList::default(),
             input: Bytes::new(),
         };
-        let hash = tx.signature_hash();
-        let (signature, raw) = sign_1559(&probe_eoa_key(), tx).expect("sign");
-        let recid = RecoveryId::from_byte(u8::from(signature.v())).expect("parity");
-        let sig = alloy::signers::k256::ecdsa::Signature::from_scalars(
-            signature.r().to_be_bytes::<32>(),
-            signature.s().to_be_bytes::<32>(),
-        )
-        .expect("scalars");
-        let recovered =
-            VerifyingKey::recover_from_prehash(hash.as_slice(), &sig, recid).expect("recover");
-        assert_eq!(
-            alloy::signers::utils::public_key_to_address(&recovered),
-            probe_eoa_address()
-        );
+        let (signature, raw) = sign_1559(&probe_eoa_key(), tx.clone()).expect("sign");
+        assert_eq!(sender(&tx, &signature), probe_eoa_address());
         // And it goes out as a typed transaction: the 0x02 envelope byte.
         assert_eq!(raw.first(), Some(&2u8));
     }
