@@ -458,6 +458,61 @@ mod tests {
         assert_ne!(fnv("merkleRoot"), fnv("boundParamsHash"));
     }
 
+    // THE WHOLE THING, over the real artifact. `#[ignore]` because it needs
+    // the network and ~900 KB of download, not because it is optional: it is
+    // the only test that proves the signal SHAPES above match the circuit the
+    // engine proves with, and a wrong shape is the failure that reads as a
+    // wonderfully fast measurement. Run it before trusting a device number:
+    //
+    //   cargo test --no-default-features -- --ignored --nocapture
+    //
+    // On a desktop every backend in the image runs, so it is also the
+    // calibration a handset's number is read against.
+    #[test]
+    #[ignore = "needs the network (~900 KB artifact); run with --ignored"]
+    fn the_real_circuit_generates_a_witness_on_every_backend() {
+        let circuit = DEFAULT_CIRCUIT;
+        let started = Instant::now();
+        let (url, wasm) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(fetch_wasm(circuit))
+            .expect("the circuit artifact downloads");
+        let download_ms = started.elapsed().as_millis();
+        let out = run(
+            circuit,
+            crate::witness_engine::PROBE_ORDER,
+            &wasm,
+            url,
+            download_ms,
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(out.wasm_bytes > 1_000_000, "a RAILGUN circuit is megabytes, got {}", out.wasm_bytes);
+        for p in &out.probes {
+            assert!(
+                p.signals.iter().all(|s| s.ok()),
+                "[{}] the circuit sizes a signal differently: {:?}",
+                p.requested,
+                p.signals.iter().filter(|s| !s.ok()).collect::<Vec<_>>()
+            );
+            assert!(p.ok(), "[{}] no witness: {:?}", p.requested, p);
+            // A transact witness is tens of thousands of field elements. A
+            // handful would mean the circuit never ran -- the exact failure
+            // the signal check exists to catch, asserted again on the result.
+            assert!(
+                p.witness_len.unwrap_or(0) > 1000,
+                "[{}] witness is {:?} elements -- the circuit did not run",
+                p.requested,
+                p.witness_len
+            );
+        }
+        // Every backend must agree on the witness LENGTH: they ran the same
+        // circuit, so a different length means one of them ran something else.
+        let lens: Vec<_> = out.probes.iter().map(|p| p.witness_len).collect();
+        assert!(lens.windows(2).all(|w| w[0] == w[1]), "backends disagree: {lens:?}");
+    }
+
     // A short input set is the failure this probe exists to not have: the
     // circuit would never run and the run would look FAST.
     #[test]
