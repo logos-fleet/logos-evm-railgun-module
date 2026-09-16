@@ -45,6 +45,7 @@ use serde_json::{json, Value};
 use userop_kit::signable_user_operation::SignableUserOperation;
 
 use crate::engine::RailgunEngine;
+use crate::live_send;
 use crate::private_send;
 use crate::proof_circuit;
 use crate::relay;
@@ -185,6 +186,30 @@ pub trait RailgunModule: 'static {
     /// from a fixed seed and keeps its state in memory. See
     /// [`crate::private_send`].
     fn private_send_probe(&mut self, params_json: String) -> String;
+    /// AND THE SAME SEND WITH NOTHING SUBSTITUTED — ON CHAIN, MINED, AND
+    /// ACCEPTED BY THE CONTRACT.
+    /// `{ "asset"?, "shield"?, "transfer"?, "memo"?, "broadcast"?, "confirmMs"? }`
+    /// → `{ ok, chainId, eoa, ethWei, tokenUnits, needsFunding?, asset, from, to,
+    /// approveTx, shieldTx, shieldBlock, balance, transferred, circuit,
+    /// rootOnChain, calldataBytes, transferTx, transferBlock, totalMs,
+    /// legs: [{ name, ms, ok, error? }] }`.
+    ///
+    /// [`Self::private_send_probe`] fabricates exactly one thing — the `Shield`
+    /// event — and says so with `rootOnChain: false`. This fabricates nothing:
+    /// it shields real ERC-20 with a real transaction, waits for a block, syncs
+    /// the REAL Sepolia tree, proves over the root the CONTRACT holds, and
+    /// broadcasts the proved `transact(...)` so the contract itself verifies the
+    /// proof this device produced. `rootOnChain: true` is #213's acceptance
+    /// clause 1.
+    ///
+    /// It signs with an EOA OF ITS OWN whose key is derived from a seed printed
+    /// in `live_send.rs` — public by construction, because the user's account
+    /// cannot sign for an agent (keystore needs a human and a password) and a
+    /// probe must never hold anything worth taking. Sepolia only, refused before
+    /// any chain read otherwise. Until an operator funds that address every run
+    /// stops at the `funding` leg and reports what to send.
+    /// See [`crate::live_send`].
+    fn live_send_probe(&mut self, params_json: String) -> String;
     /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
     /// `{ ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread,
     /// callerKind, callerIdentity, callerIsThisModule,
@@ -728,6 +753,95 @@ impl RailgunModule for RailgunModuleImpl {
             "circuit": run.circuit,
             "rootOnChain": run.root_on_chain,
             "calldataBytes": run.calldata_bytes,
+            "totalMs": run.total_ms,
+            "legs": run.legs.iter().map(|l| json!({
+                "name": l.name,
+                "ms": l.ms,
+                "ok": l.ok(),
+                "error": l.error,
+            })).collect::<Vec<Value>>(),
+            "error": run.error,
+        })
+        .to_string()
+    }
+
+    fn live_send_probe(&mut self, params_json: String) -> String {
+        /// Every field is optional and overrides the matching
+        /// [`live_send::Params`] default. `chainId` is deliberately NOT here:
+        /// the probe's key is public, so the chain is a property of the probe
+        /// rather than a choice its caller makes.
+        #[derive(Deserialize, Default)]
+        struct Requested {
+            #[serde(default)]
+            asset: Option<String>,
+            /// Decimal strings: a u128 amount exceeds JSON's safe-integer range.
+            #[serde(default)]
+            shield: Option<String>,
+            #[serde(default)]
+            transfer: Option<String>,
+            #[serde(default)]
+            memo: Option<String>,
+            #[serde(default)]
+            broadcast: Option<bool>,
+            #[serde(rename = "confirmMs", default)]
+            confirm_ms: Option<u64>,
+        }
+        let requested: Requested = match optional_params(&params_json) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        let mut params = live_send::Params::default();
+        if let Some(a) = &requested.asset {
+            match Address::from_str(a) {
+                Ok(a) => params.asset = Some(a),
+                Err(e) => return err(format!("bad asset address {a:?}: {e}")),
+            }
+        }
+        if let Some(v) = &requested.shield {
+            match parse_amount(v) {
+                Ok(v) => params.shield = v,
+                Err(e) => return err(e),
+            }
+        }
+        if let Some(v) = &requested.transfer {
+            match parse_amount(v) {
+                Ok(v) => params.transfer = Some(v),
+                Err(e) => return err(e),
+            }
+        }
+        if let Some(m) = requested.memo {
+            params.memo = m;
+        }
+        if let Some(b) = requested.broadcast {
+            params.broadcast = b;
+        }
+        if let Some(ms) = requested.confirm_ms {
+            params.confirm_ms = ms;
+        }
+
+        let backend = Arc::new(EthRpcBackend { chain_id: params.chain_id as i64 });
+        let run = block_on(live_send::run(backend, params));
+        json!({
+            "ok": run.ok(),
+            "chainId": run.chain_id,
+            "eoa": run.eoa,
+            // Decimal strings for the same reason the params are.
+            "ethWei": run.eth_wei.map(|v| v.to_string()),
+            "tokenUnits": run.token_units.map(|v| v.to_string()),
+            "needsFunding": run.needs_funding,
+            "asset": run.asset,
+            "from": run.from,
+            "to": run.to,
+            "approveTx": run.approve_tx,
+            "shieldTx": run.shield_tx,
+            "shieldBlock": run.shield_block,
+            "balance": run.balance.map(|v| v.to_string()),
+            "transferred": run.transferred.map(|v| v.to_string()),
+            "circuit": run.circuit,
+            "rootOnChain": run.root_on_chain,
+            "calldataBytes": run.calldata_bytes,
+            "transferTx": run.transfer_tx,
+            "transferBlock": run.transfer_block,
             "totalMs": run.total_ms,
             "legs": run.legs.iter().map(|l| json!({
                 "name": l.name,

@@ -4,7 +4,7 @@
 //!
 //! Authoring split (mirrors `uniswap_module`): the pure, cargo-testable cores
 //! (`rpc_backend`, `keys`, `db_adapter`, `engine`, `relay`, `witness_engine`,
-//! `witness_circuit`, `proof_circuit`, `private_send`)
+//! `witness_circuit`, `proof_circuit`, `private_send`, `live_send`)
 //! carry no Logos dependency and are tested with `cargo test
 //! --no-default-features`. The `glue` module (behind the default `logos_module`
 //! feature) wires the contract trait to the Logos runtime via `logos-rust-sdk`.
@@ -15,6 +15,7 @@
 pub mod db_adapter;
 pub mod engine;
 pub mod keys;
+pub mod live_send;
 pub mod private_send;
 pub mod proof_circuit;
 pub mod relay;
