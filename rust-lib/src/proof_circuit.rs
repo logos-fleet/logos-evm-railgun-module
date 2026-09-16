@@ -155,7 +155,7 @@ pub struct Leg {
 
 impl Leg {
     /// A step that completed and moved nothing over the network.
-    fn timed(name: &'static str, ms: Option<u128>) -> Leg {
+    pub(crate) fn timed(name: &'static str, ms: Option<u128>) -> Leg {
         Leg { name, ms, bytes: None, error: None }
     }
 
@@ -166,7 +166,7 @@ impl Leg {
 
     /// A step that did not complete. `ms` is what it spent before failing
     /// where that is known, so a slow failure is still visible as one.
-    fn failed(name: &'static str, ms: Option<u128>, error: String) -> Leg {
+    pub(crate) fn failed(name: &'static str, ms: Option<u128>, error: String) -> Leg {
         Leg { name, ms, bytes: None, error: Some(error) }
     }
 

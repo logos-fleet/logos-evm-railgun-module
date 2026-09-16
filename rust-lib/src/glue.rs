@@ -39,14 +39,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use alloy::primitives::{Address, B256};
+use eip_1193_provider::provider::Eip1193Provider;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use userop_kit::signable_user_operation::SignableUserOperation;
 
 use crate::engine::RailgunEngine;
+use crate::private_send;
 use crate::proof_circuit;
 use crate::relay;
-use crate::rpc_backend::RpcBackend;
+use crate::rpc_backend::{EthRpcEip1193, RpcBackend};
 use crate::web_dependency::{self, Dependency, Leg};
 use crate::witness_circuit;
 use crate::witness_engine;
@@ -161,6 +163,28 @@ pub trait RailgunModule: 'static {
     /// — the milliseconds are a property of the circuit, the verdict is a
     /// property of the values. See [`crate::proof_circuit`].
     fn proof_circuit_probe(&mut self, params_json: String) -> String;
+    /// A WHOLE PRIVATE SEND, THROUGH THE ENGINE'S OWN PATH, ON A CHAIN WITH NO
+    /// MONEY IN IT.
+    /// `{ ok, engineSeam, chainId, asset, from, to, balance, circuit,
+    /// rootOnChain, calldataBytes, totalMs, legs: [{ name, ms, ok, error? }] }`.
+    ///
+    /// `proof_circuit_probe` proved the engine's own `calculate_witness` runs on
+    /// a device, but over the circuit's real SHAPE with placeholder VALUES — so
+    /// its proof could not verify. This runs the REAL thing: the engine decrypts
+    /// a shielded note, selects it, builds the merkle proof, signs the
+    /// bound-params hash, generates the witness and proves AND VERIFIES with
+    /// `Groth16Prover` — `ok` is therefore a proof a verifier accepted.
+    ///
+    /// The one thing it fabricates is the chain event that would have put the
+    /// note there, handed to the engine through its own public
+    /// `RailgunBuilder::with_utxo_syncer` seam, because the venue's account has
+    /// no testnet funds and faucets are captcha-gated. `rootOnChain` reports
+    /// that limit rather than hiding it: it is `false` until a real shield is
+    /// mined. Needs the network (~3.5 MB of artifacts) and `eth_rpc_module`; no
+    /// keys, no keystore, and nothing of the user's — the probe derives its own
+    /// from a fixed seed and keeps its state in memory. See
+    /// [`crate::private_send`].
+    fn private_send_probe(&mut self, params_json: String) -> String;
     /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
     /// `{ ok, target, dispatchThread, loadThread, dispatchLeftTheLoadThread,
     /// callerKind, callerIdentity, callerIsThisModule,
@@ -629,6 +653,85 @@ impl RailgunModule for RailgunModuleImpl {
                 "name": l.name,
                 "ms": l.ms,
                 "bytes": l.bytes,
+                "ok": l.ok(),
+                "error": l.error,
+            })).collect::<Vec<Value>>(),
+            "error": run.error,
+        })
+        .to_string()
+    }
+
+    fn private_send_probe(&mut self, params_json: String) -> String {
+        /// Every field is optional and overrides the matching
+        /// [`private_send::Params`] default.
+        #[derive(Deserialize, Default)]
+        struct Requested {
+            #[serde(rename = "chainId", default)]
+            chain_id: Option<u64>,
+            #[serde(default)]
+            asset: Option<String>,
+            /// Decimal strings: u128 wei exceeds JSON's safe-integer range.
+            #[serde(default)]
+            shield: Option<String>,
+            #[serde(default)]
+            transfer: Option<String>,
+            #[serde(default)]
+            memo: Option<String>,
+            #[serde(default)]
+            repeat: Option<bool>,
+        }
+        let requested: Requested = match optional_params(&params_json) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        let mut params = private_send::Params::default();
+        if let Some(c) = requested.chain_id {
+            params.chain_id = c;
+        }
+        if let Some(a) = &requested.asset {
+            match Address::from_str(a) {
+                Ok(a) => params.asset = Some(a),
+                Err(e) => return err(format!("bad asset address {a:?}: {e}")),
+            }
+        }
+        if let Some(v) = &requested.shield {
+            match parse_amount(v) {
+                Ok(v) => params.shield = v,
+                Err(e) => return err(e),
+            }
+        }
+        if let Some(v) = &requested.transfer {
+            match parse_amount(v) {
+                Ok(v) => params.transfer = v,
+                Err(e) => return err(e),
+            }
+        }
+        if let Some(m) = requested.memo {
+            params.memo = m;
+        }
+        if let Some(r) = requested.repeat {
+            params.repeat = r;
+        }
+
+        let backend = Arc::new(EthRpcBackend { chain_id: params.chain_id as i64 });
+        let eip1193: Arc<dyn Eip1193Provider> = Arc::new(EthRpcEip1193::new(backend));
+        let run = block_on(private_send::run(eip1193, params));
+        json!({
+            "ok": run.ok(),
+            "engineSeam": run.engine_seam,
+            "chainId": run.chain_id,
+            "asset": run.asset,
+            "from": run.from,
+            "to": run.to,
+            // Decimal string for the same reason the params are.
+            "balance": run.balance.map(|b| b.to_string()),
+            "circuit": run.circuit,
+            "rootOnChain": run.root_on_chain,
+            "calldataBytes": run.calldata_bytes,
+            "totalMs": run.total_ms,
+            "legs": run.legs.iter().map(|l| json!({
+                "name": l.name,
+                "ms": l.ms,
                 "ok": l.ok(),
                 "error": l.error,
             })).collect::<Vec<Value>>(),

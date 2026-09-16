@@ -20,6 +20,7 @@
 #   pub mod logos_engine_seam {
 #       pub use crate::circuit::remote_artifact_loader::RemoteArtifactLoader;
 #       pub use crate::circuit::witness::calculate_witness;
+#       pub use crate::note::encrypt::encrypt_shield;
 #   }
 #
 # IT IS A RE-EXPORT OF ITEMS THAT ARE ALREADY `pub`; what it adds is a path.
@@ -28,6 +29,15 @@
 #   src/circuit/mod.rs   mod witness;                -> pub(crate) mod witness;
 #                        mod remote_artifact_loader; -> pub(crate) mod ...;
 #   src/lib.rs           + pub mod logos_engine_seam { pub use ...; }
+#
+# `encrypt_shield` needs NEITHER edit and is the reason the seam grew a third
+# line (#213, second cycle). `mod note;` is declared at the crate ROOT, and a
+# private module is visible to the module that declares it -- so the facade,
+# which lives in that same lib.rs, can already see `crate::note::encrypt`
+# (itself `pub mod`). It is the engine's own shield encryption, the one
+# `ShieldBuilder::build` calls, and it is what lets a probe hand the engine a
+# note it will decrypt as its own: the last thing between this module and an
+# end-to-end `prepare_transfer` that does not need a funded chain.
 #
 # `pub(crate)` and not `pub`: a private module is visible in the module that
 # declares it and its DESCENDANTS, and the facade is a sibling of `circuit`
@@ -77,13 +87,19 @@ crate="${dirs[0]}"
 lib="${crate}src/lib.rs"
 circuit_mod="${crate}src/circuit/mod.rs"
 for f in "$lib" "$circuit_mod" "${crate}src/circuit/witness.rs" \
-         "${crate}src/circuit/remote_artifact_loader.rs"; do
+         "${crate}src/circuit/remote_artifact_loader.rs" "${crate}src/note/encrypt.rs"; do
   [ -f "$f" ] || die "$f does not exist -- kohaku moved the witness path; this script, \
 rust-lib/src/proof_circuit.rs and patch-kohaku-witness-backend.sh need updating together."
 done
 
 grep -q -x -F 'mod circuit;' "$lib" || die "'mod circuit;' is not in $lib -- the engine crate's \
 module layout changed; re-read it before re-anchoring (#213)."
+
+grep -q -x -F 'mod note;' "$lib" || die "'mod note;' is not in $lib -- the engine crate's \
+module layout changed; the seam's third re-export (encrypt_shield) has no path without it."
+
+grep -q -x -F 'pub mod encrypt;' "${crate}src/note/mod.rs" || die "'pub mod encrypt;' is not in \
+${crate}src/note/mod.rs -- encrypt_shield moved; rust-lib/src/private_send.rs needs updating with it."
 
 grep -q 'logos_engine_seam' "$lib" && die "$lib already declares logos_engine_seam -- \
 kohaku grew a seam of its own; use it and delete this script."
@@ -111,15 +127,23 @@ cat >> "$lib" <<'RUST'
 // (rust-lib/patch-kohaku-engine-seam.sh). `mod circuit` is private at this
 // crate's root, so `calculate_witness` -- the function #188's sibling patch
 // rewrote to choose the witness store's backend -- cannot be called by any
-// consumer, and had therefore never run on a device. Both items below are
-// already `pub` in their own modules; this only adds a path to them, so no
+// consumer, and had therefore never run on a device. Every item below is
+// already `pub` in its own module; this only adds a path to it, so no
 // signature changes and no private type is exposed.
+//
+// `encrypt_shield` is the engine's own shield encryption -- the call
+// `ShieldBuilder::build` makes for every shield it emits. It is here so a
+// probe can hand the indexer a commitment the engine decrypts as its own
+// note, which is the only part of a private send that a chain with no funds
+// otherwise withholds (#213).
 #[doc(hidden)]
+#[allow(private_interfaces)]
 pub mod logos_engine_seam {
     pub use crate::circuit::remote_artifact_loader::{
         RemoteArtifactLoader, RemoteArtifactLoaderError,
     };
     pub use crate::circuit::witness::{calculate_witness, CalculateWitnessError};
+    pub use crate::note::encrypt::encrypt_shield;
 }
 RUST
 
@@ -142,4 +166,4 @@ awk -v anchor="$anchor" '
 mv -f "$manifest.patched" "$manifest"
 grep -q -x -F 'default = ["logos_module", "engine_seam"]' "$manifest" || die "post-condition failed: engine_seam is not in $manifest's default features"
 
-say "seam appended to ${crate}src/lib.rs (two modules widened to pub(crate)) and engine_seam enabled -- proof_circuit can call the engine's own calculate_witness"
+say "seam appended to ${crate}src/lib.rs (two modules widened to pub(crate)) and engine_seam enabled -- proof_circuit can call the engine's own calculate_witness, private_send its own encrypt_shield"
