@@ -95,7 +95,11 @@ pub const SANITY_CHECK: bool = false;
 /// A placeholder field element. Not 0: a zero input is the one value that can
 /// short-circuit a multiplication chain in a way a real one would not, and it
 /// is also what an unwritten signal already holds.
-const FILLER: u32 = 7;
+///
+/// `pub` because [`crate::proof_circuit`] feeds the ENGINE's own
+/// `calculate_witness` the same placeholders in its own type, and two
+/// different fillers would make the two witnesses incomparable.
+pub const FILLER: u32 = 7;
 
 /// `NNxMM` — the transact circuit for NN nullifiers (notes spent) and MM output
 /// commitments. The engine builds the same name in `Groth16Prover::prove_transact`.
@@ -302,7 +306,7 @@ pub fn run(circuit: &str, backends: &[Backend], wasm: &[u8], url: String, downlo
 /// One backend, announced and reported as it happens — an earlier backend's
 /// number survives a later one's death.
 pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
-    let p = measure(which, circuit, shape, wasm);
+    let (p, _) = measure(which, circuit, shape, wasm);
     eprintln!(
         "railgun_module: witness-circuit probe [{}] {circuit}: {} (backend={} reached={} \
          compile={:?}ms instantiate={:?}ms witness={:?}ms len={:?} nonzero={:?} error={:?})",
@@ -320,9 +324,22 @@ pub fn probe_backend(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -
     p
 }
 
+/// One backend's run WITH the witness itself, for a caller that needs the
+/// values rather than a measurement — [`crate::proof_circuit`] proves over
+/// them. [`probe_backend`] is this with the values dropped, so the two can
+/// never measure different runs.
+pub fn measure_witness(
+    which: Backend,
+    circuit: &str,
+    shape: Shape,
+    wasm: &[u8],
+) -> (Probe, Option<Vec<BigInt>>) {
+    measure(which, circuit, shape, wasm)
+}
+
 /// The stages themselves, silent about the outcome: [`probe_backend`] is what
 /// reports it.
-fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
+fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> (Probe, Option<Vec<BigInt>>) {
     entering(which, circuit, stage::ENGINE);
     let mut store = which.store();
     let mut out = Probe {
@@ -344,7 +361,7 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
         Ok(m) => m,
         Err(e) => {
             out.error = Some(format!("compile: {e}"));
-            return out;
+            return (out, None);
         }
     };
     out.compile_ms = Some(t.elapsed().as_millis());
@@ -356,7 +373,7 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
         Ok(w) => w,
         Err(e) => {
             out.error = Some(format!("instantiate: {e}"));
-            return out;
+            return (out, None);
         }
     };
 
@@ -370,14 +387,14 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
              refusing to time a run the circuit would not complete",
             bad.name, bad.expected, bad.declared
         ));
-        return out;
+        return (out, None);
     }
 
     let mut calculator = match WitnessCalculator::new_from_wasm(&mut store, runtime) {
         Ok(c) => c,
         Err(e) => {
             out.error = Some(format!("instantiate: {e}"));
-            return out;
+            return (out, None);
         }
     };
     out.instantiate_ms = Some(t.elapsed().as_millis());
@@ -399,10 +416,13 @@ fn measure(which: Backend, circuit: &str, shape: Shape, wasm: &[u8]) -> Probe {
             out.witness_nonzero = Some(w.iter().filter(|v| **v != zero).count());
             out.witness_len = Some(w.len());
             out.reached = stage::WITNESS;
+            (out, Some(w))
         }
-        Err(e) => out.error = Some(format!("witness: {e}")),
+        Err(e) => {
+            out.error = Some(format!("witness: {e}"));
+            (out, None)
+        }
     }
-    out
 }
 
 /// Ask the circuit how big each signal it is about to be fed really is.
