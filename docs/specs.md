@@ -120,9 +120,30 @@ the plan, so the percentage cannot go backwards as the chain advances; a send
 needs the tree to hold its own shield and the blocks after that are the next
 sync's business.
 
+Measured through the mobile Shell on an **iPad Air 13-inch (M2) simulator**,
+Bundled set `railgun_module,capability_module`, against public Sepolia — a cold
+engine, so the whole history:
+
 ```
-railgun_module: sync 32% (7200/22000 blocks, at 11720455, target 11742455, eta Some(4100)ms)
+[shell] CALL OK railgun_module.sync_status() -> {"blocksRemaining":11720699,
+        "done":false,"percent":0,"running":false,"syncedBlock":0,"targetBlock":11720699}
+railgun_module: sync 0% (25000/11720699 blocks, at 25000, target 11720699, eta Some(305491)ms)
+…
+railgun_module: sync 100% (11720699/11720699 blocks, at 11720699, target 11720699, eta Nonems)
+[shell] CALL OK railgun_module.sync_step(str:{"budgetMs":120000}) -> {"done":true,
+        "percent":100,"windows":469,"elapsedMs":195090,"stepMs":75369,"syncedBlock":11720699}
 ```
+
+**AND THAT RUN FOUND A SECOND COST, WHICH IS WHY THE WINDOWS ARE NOT UNIFORM.**
+469 windows and 195 s, where one `sync()` over the same range is about 8 s: every
+window re-asked subsquid for the same page-set and re-ran the indexer's own
+`verify()`. Subsquid is cheap per block and `eth_getLogs` is not, so the plan
+takes **everything up to the subsquid frontier in ONE window**
+(`sync::subsquid_frontier`, which is the block of the last RAILGUN transaction
+subsquid has indexed — the same number `ChainedSyncer` hands over to the RPC
+syncer at) and steps only the tail after it. `fastForwardTo` in the reply is that
+block. A cold sync is then one big window plus a handful of small ones:
+`sync::tests::the_subsquid_half_is_taken_in_one_window` asserts 4, not 469.
 
 **THE CANCEL PATH IS: STOP CALLING IT**, and that is the whole of it. There is
 nothing to roll back — a sync only READS the chain, `UtxoIndexer::sync_to`
@@ -144,7 +165,7 @@ module rather than an omission: `concurrency: "single"`, and the engine is
 `&mut`-driven and not `Send`, so nothing can be answered while a long call holds
 the dispatch thread. Stepping is what makes a cancel possible at all.
 
-### `sync_status() → { ok, running, done, startBlock, syncedBlock, targetBlock, percent, … }`
+### `sync_status() → { ok, running, done, startBlock, syncedBlock, targetBlock, percent, fastForwardTo, … }`
 Where the sync is, **without doing any of it** — the same fields `sync_step`
 answers with. With a plan in progress it reports that plan; with none it reads
 the engine's persisted `synced_block` and asks the chain for its head, which is

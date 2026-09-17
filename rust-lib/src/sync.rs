@@ -139,6 +139,28 @@ pub fn utxo_syncer(
     )
 }
 
+/// HOW FAR SUBSQUID HAS INDEXED — and therefore where the cheap half of a sync
+/// ends and the expensive half begins.
+///
+/// Not the squid's height: `SubsquidSyncer::latest_block` is the block of the
+/// LAST RAILGUN TRANSACTION it has seen, and that is the number the
+/// `ChainedSyncer` hands over to the RPC syncer at. Everything up to it comes
+/// out of one GraphQL page-set in seconds whatever the range; everything after
+/// it is `eth_getLogs`.
+///
+/// Which is why a stepped sync asks: measured on an iPad Air 13-inch simulator,
+/// stepping a COLD sync of the whole Sepolia history in 25 000-block windows
+/// cost **469 windows and 195 s**, where one `sync()` is about 8 s — every
+/// window re-asked subsquid for the same page-set and re-ran the indexer's own
+/// `verify()`. Windowing is for the part that is slow per block; the part that
+/// is fast per block is one window ([`Plan::with_fast_forward`]).
+///
+/// `None` when subsquid will not answer — a sync then steps the whole range and
+/// is slow rather than wrong.
+pub async fn subsquid_frontier(chain: &ChainConfig) -> Option<u64> {
+    SubsquidSyncer::new(&chain.subsquid_endpoint).latest_block().await.ok()
+}
+
 /// The engine's KV key for the UTXO indexer's own state (`railgun_db.rs`).
 const UTXO_INDEXER_KEY: &[u8] = b"utxo_indexer";
 
@@ -192,6 +214,9 @@ pub struct Plan {
     pub windows: u32,
     /// Milliseconds spent inside those windows (not wall time between them).
     pub elapsed_ms: u128,
+    /// The block up to which ONE window is taken however far away it is — the
+    /// subsquid frontier. See [`Plan::with_fast_forward`].
+    pub fast_forward_to: u64,
 }
 
 impl Plan {
@@ -202,7 +227,21 @@ impl Plan {
             target_block: target_block.max(synced_block),
             windows: 0,
             elapsed_ms: 0,
+            fast_forward_to: synced_block,
         }
+    }
+
+    /// TAKE THE CHEAP HALF IN ONE WINDOW. Everything up to `block` comes out of
+    /// subsquid in one page-set whatever its size ([`subsquid_frontier`]), so
+    /// cutting it into windows buys no interruptibility worth having and costs a
+    /// GraphQL round trip and an indexer `verify()` each — measured on a
+    /// simulator, 469 windows and 195 s for a cold sync that is 8 s whole.
+    ///
+    /// A `block` at or behind where the plan already is changes nothing, so a
+    /// caller can pass whatever subsquid answered without checking it.
+    pub fn with_fast_forward(mut self, block: u64) -> Self {
+        self.fast_forward_to = block.max(self.synced_block).min(self.target_block);
+        self
     }
 
     /// The block one more window would reach, or `None` when there is nothing
@@ -210,6 +249,9 @@ impl Plan {
     pub fn next_window_end(&self, window_blocks: u64) -> Option<u64> {
         if self.done() {
             return None;
+        }
+        if self.synced_block < self.fast_forward_to {
+            return Some(self.fast_forward_to);
         }
         Some(self.synced_block.saturating_add(window_blocks.max(1)).min(self.target_block))
     }
@@ -274,6 +316,7 @@ impl Plan {
             "windows": self.windows,
             "elapsedMs": self.elapsed_ms,
             "etaMs": self.eta_ms(),
+            "fastForwardTo": self.fast_forward_to,
             "done": self.done(),
         })
     }
@@ -414,6 +457,43 @@ mod tests {
         assert_eq!(plan.windows, 3);
         assert_eq!(plan.next_window_end(100), None, "nothing left to ask for");
         assert_eq!(plan.eta_ms(), None, "a finished plan has no time to go");
+    }
+
+    // THE CHEAP HALF IS ONE WINDOW. Measured on an iPad Air 13-inch simulator: a
+    // cold sync stepped in 25 000-block windows took 469 windows and 195 s where
+    // one `sync()` is ~8 s, because every window re-asked subsquid for the same
+    // page-set. Everything up to the subsquid frontier is therefore one window,
+    // and only the `eth_getLogs` tail after it is stepped.
+    #[test]
+    fn the_subsquid_half_is_taken_in_one_window() {
+        const FRONTIER: u64 = 11_718_000;
+        const HEAD: u64 = 11_720_200;
+        let mut plan = Plan::new(0, HEAD).with_fast_forward(FRONTIER);
+
+        let first = plan.next_window_end(25_000).expect("work to do");
+        assert_eq!(first, FRONTIER, "11.7 M blocks of history, one window");
+        plan.record(first, 8_000);
+
+        // ...and the 2 200-block tail after it is stepped as usual.
+        assert_eq!(plan.next_window_end(1_000), Some(FRONTIER + 1_000));
+        plan.record(FRONTIER + 1_000, 200);
+        assert_eq!(plan.next_window_end(1_000), Some(FRONTIER + 2_000));
+        plan.record(FRONTIER + 2_000, 200);
+        assert_eq!(plan.next_window_end(1_000), Some(HEAD), "the last one is short");
+        plan.record(HEAD, 40);
+        assert!(plan.done());
+        assert_eq!(plan.windows, 4, "not 469");
+    }
+
+    #[test]
+    fn a_frontier_behind_the_plan_changes_nothing() {
+        // A device that synced yesterday is already PAST the frontier, so the
+        // caller must be able to pass whatever subsquid answered unchecked.
+        let plan = Plan::new(11_719_000, 11_720_200).with_fast_forward(11_718_000);
+        assert_eq!(plan.next_window_end(1_000), Some(11_720_000));
+        // And a frontier past the target cannot make a window overshoot it.
+        let ahead = Plan::new(0, 500).with_fast_forward(9_999);
+        assert_eq!(ahead.next_window_end(10), Some(500));
     }
 
     #[test]

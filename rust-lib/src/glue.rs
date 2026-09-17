@@ -557,7 +557,15 @@ impl RailgunModule for RailgunModuleImpl {
                     Ok(t) => t,
                     Err(e) => return err(e),
                 };
-                *slot = Some(Plan::new(synced, target));
+                // The subsquid half in one window; only the `eth_getLogs`
+                // tail after it is stepped. Without this a cold sync is 469
+                // windows and 195 s where one call is ~8 s -- measured on an
+                // iPad Air 13-inch simulator, which is how it was found.
+                let mut plan = Plan::new(synced, target);
+                if let Some(frontier) = engine.subsquid_frontier().await {
+                    plan = plan.with_fast_forward(frontier);
+                }
+                *slot = Some(plan);
             }
             let plan = slot.as_mut().expect("just filled");
 
@@ -624,6 +632,8 @@ impl RailgunModule for RailgunModuleImpl {
             let mut out = Plan::new(synced, target).to_json();
             out["ok"] = json!(true);
             out["running"] = json!(false);
+            // No frontier query here: `sync_status` costs one `eth_blockNumber`
+            // and nothing else, which is what makes it safe to ask often.
             out.to_string()
         })
     }

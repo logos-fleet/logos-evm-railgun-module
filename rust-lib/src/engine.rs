@@ -45,6 +45,8 @@ pub struct RailgunEngine {
     /// engine exposes no getter for it and a stepped sync needs to know where it
     /// is starting from.
     db: Arc<dyn railgun::database::Database>,
+    /// Kept for the subsquid endpoint the stepped sync asks for its frontier.
+    chain: ChainConfig,
 }
 
 /// Parse a `0x…`/bare ERC-20 token address into an `AssetId`.
@@ -94,7 +96,7 @@ impl RailgunEngine {
             .await
             .map_err(|e| format!("register signer: {e}"))?;
 
-        Ok(Self { provider, address, signer, eip1193, chain_id, wrapped_base_token, db })
+        Ok(Self { provider, address, signer, eip1193, chain_id, wrapped_base_token, db, chain })
     }
 
     /// Build the engine deriving its railgun keys from an opaque `seed` (a
@@ -143,6 +145,11 @@ impl RailgunEngine {
     /// The chain's current head — where a sync started now would be going.
     pub async fn latest_block(&self) -> Result<u64, String> {
         self.eip1193.get_block_number().await.map_err(|e| format!("eth_blockNumber: {e}"))
+    }
+
+    /// Where subsquid's cheap half ends — see [`sync::subsquid_frontier`].
+    pub async fn subsquid_frontier(&self) -> Option<u64> {
+        sync::subsquid_frontier(&self.chain).await
     }
 
     /// Shielded balance per asset, as the engine's `BalanceEntry` JSON array.

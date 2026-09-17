@@ -828,7 +828,12 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             return out.finished(started);
         }
     };
-    let mut plan = SyncPlan::new(sync::synced_block(db.as_ref(), Some(&from.to_string())).await, head);
+    let mut plan =
+        SyncPlan::new(sync::synced_block(db.as_ref(), Some(&from.to_string())).await, head);
+    // The subsquid half in one window -- see `sync::subsquid_frontier`.
+    if let Some(frontier) = sync::subsquid_frontier(&chain).await {
+        plan = plan.with_fast_forward(frontier);
+    }
     out.sync_from_block = Some(plan.start_block);
     out.sync_to_block = Some(plan.target_block);
     while let Some(end) = plan.next_window_end(sync::DEFAULT_WINDOW_BLOCKS) {
