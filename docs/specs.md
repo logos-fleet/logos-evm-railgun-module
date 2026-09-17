@@ -98,7 +98,172 @@ returned. Binds the railgun wallet to the EOA (same EOA → same `0zk` address).
 The public `0zk1…` address (requires `init`/`init_from_seed`).
 
 ### `sync() → { ok }`
-Sync UTXO/TXID (and POI, if enabled) state to the latest block. Needs a live chain.
+Sync UTXO/TXID (and POI, if enabled) state to the latest block. Needs a live
+chain. **One call, as long as it takes** — 221 s on a physical iPad Air 4 before
+#235, with nothing to report and nothing to interrupt. Use it where there is no
+user; `sync_step` is the same work in bounded pieces.
+
+### `sync_step(params_json) → { ok, done, startBlock, syncedBlock, targetBlock, blocksTotal, blocksDone, blocksRemaining, percent, windows, elapsedMs, etaMs, stepMs }`
+**THE PROGRESS SURFACE, AND THE CANCEL PATH (#235).** `{ "blocks"?: u64,
+"budgetMs"?: u64 }`; both optional (25 000 blocks, 20 000 ms).
+
+The accumulator sync is the whole cost of a private send — **221 s of the 239 s**
+one took on a handset, against 3.6 s for witness + Groth16 + verify — and
+`sync()` does it in one opaque call that cannot be shown, cannot be interrupted
+and outlasts any caller's timeout. `sync_step` does the same work in windows:
+each call syncs at most `blocks` and returns after `budgetMs` whether or not it
+finished, so **no call takes minutes** and between calls the caller has a real
+percentage and an ETA rather than a spinner.
+
+Call it until `done` is true. The target is **pinned** when the first step makes
+the plan, so the percentage cannot go backwards as the chain advances; a send
+needs the tree to hold its own shield and the blocks after that are the next
+sync's business.
+
+Measured through the mobile Shell on an **iPad Air 13-inch (M2) simulator**,
+Bundled set `railgun_module,capability_module`, against public Sepolia — a cold
+engine, so the whole history:
+
+```
+[shell] CALL OK railgun_module.sync_status() -> {"blocksRemaining":11720699,
+        "done":false,"percent":0,"running":false,"syncedBlock":0,"targetBlock":11720699}
+railgun_module: sync 0% (25000/11720699 blocks, at 25000, target 11720699, eta Some(305491)ms)
+…
+railgun_module: sync 100% (11720699/11720699 blocks, at 11720699, target 11720699, eta Nonems)
+[shell] CALL OK railgun_module.sync_step(str:{"budgetMs":120000}) -> {"done":true,
+        "percent":100,"windows":469,"elapsedMs":195090,"stepMs":75369,"syncedBlock":11720699}
+```
+
+**AND THAT RUN FOUND A SECOND COST, WHICH IS WHY THE WINDOWS ARE NOT UNIFORM.**
+469 windows and 195 s, where one `sync()` over the same range is about 8 s: every
+window re-asked subsquid for the same page-set and re-ran the indexer's own
+`verify()`. Subsquid is cheap per block and `eth_getLogs` is not, so the plan
+takes **everything up to the subsquid frontier in ONE window**
+(`sync::subsquid_frontier`, which is the block of the last RAILGUN transaction
+subsquid has indexed — the same number `ChainedSyncer` hands over to the RPC
+syncer at) and steps only the tail after it. `fastForwardTo` in the reply is that
+block. A cold sync is then one big window plus a handful of small ones:
+`sync::tests::the_subsquid_half_is_taken_in_one_window` asserts 4, not 469.
+
+**AND THE SECOND SYNC ON THE SAME DEVICE IS THE ANSWER TO "can it be made
+incremental".** Relaunched on the same simulator after the run above — new app
+install, same instance persistence dir — with the frontier fix in:
+
+```
+[shell] CALL OK railgun_module.sync_status() -> {"blocksRemaining":110,"done":false,
+        "fastForwardTo":11720699,"percent":0,"running":false,
+        "startBlock":11720699,"syncedBlock":11720699,"targetBlock":11720809}
+railgun_module: sync 100% (110/110 blocks, at 11720809, target 11720809, eta Nonems)
+[shell] CALL OK railgun_module.sync_step(str:{"budgetMs":120000}) -> {"done":true,
+        "percent":100,"windows":1,"elapsedMs":506,"syncedBlock":11720809}
+```
+
+**110 blocks, one window, 506 ms.** The whole history was synced once; this
+launch synced the blocks since. `DiskDatabase` is what makes that true and it
+was already there — what was missing was a caller that could ask.
+
+**And the driver's ceiling, on the same run.** `--call-timeout 1000` before the
+first `sync_step`:
+
+```
+[shell] CALL FAILED railgun_module.sync_step(str:{"budgetMs":120000}): call to
+        'railgun_module.sync_step' timed out after 1000ms (timeout)
+[shell] call: railgun_module.sync_step(str:{"budgetMs":120000}) was given 1000 ms
+        and is STILL RUNNING -- raise it with --call-timeout <ms> before --call
+```
+
+1 000 ms, not 60 000 — the budget is the call's. The module finished the work
+anyway (the next `sync_step` found the plan complete, `stepMs: 0`), which is the
+failure mode #235 was filed about, now benign and said out loud.
+
+**Arguments are `str:`, not `json:`.** These methods take a `params_json`
+`String`, and the Shell's `json:` prefix builds an OBJECT — which the module
+refuses with `expected string at arg0, got object`. `--call
+'railgun_module.sync_step(str:{"budgetMs":120000})'`; the commas inside the
+braces are the JSON's and the Shell's splitter knows it.
+
+**THE CANCEL PATH IS: STOP CALLING IT**, and that is the whole of it. There is
+nothing to roll back — a sync only READS the chain, `UtxoIndexer::sync_to`
+persists `synced_block` before each window returns, and a later step (or a later
+LAUNCH, since the record is on disk) resumes from exactly there. Asserted, not
+asserted about: `sync::tests::a_stepped_sync_keeps_every_window_and_a_later_one_resumes_from_there`
+stops three windows in, throws the engine away, builds a second one over the same
+database and finishes the remaining two.
+
+**And what a cancel does to a shield that is already mined: nothing.** It is on
+chain, the note is owned by this wallet's `0zk` address, and the next sync of any
+length finds and decrypts it. Cancelling a send after its shield is mined leaves
+the user with a **shielded balance and no transfer** — a state the wallet can
+show and spend from, not a loss and not a corruption. The funds are in the
+shielded pool; the private transfer is simply one that was never made.
+
+A module-level cancel cannot be delivered mid-call, and that is a property of the
+module rather than an omission: `concurrency: "single"`, and the engine is
+`&mut`-driven and not `Send`, so nothing can be answered while a long call holds
+the dispatch thread. Stepping is what makes a cancel possible at all.
+
+### `sync_status() → { ok, running, done, startBlock, syncedBlock, targetBlock, percent, fastForwardTo, … }`
+Where the sync is, **without doing any of it** — the same fields `sync_step`
+answers with. With a plan in progress it reports that plan; with none it reads
+the engine's persisted `synced_block` and asks the chain for its head, which is
+what a wallet wants *before* it offers to send: "this device is 2 200 blocks
+behind" is the difference between a send that is instant and one that is not.
+Costs one `eth_blockNumber` and no chain walk.
+
+### `sync_cancel() → { ok, cancelled, keptToBlock, … }`
+Drops the pinned target so the next `sync_step` plans afresh against the current
+head. **It undoes nothing**, for the reasons above; `keptToBlock` is how far the
+cancelled sync had got and a later step starts there.
+
+### Why the sync took 221 seconds, and what it takes now
+
+The engine's default UTXO syncer is `ChainedSyncer(SubsquidSyncer, RpcSyncer)`.
+Subsquid serves the history in 20 000-item pages; **everything after the last
+RAILGUN transaction subsquid has indexed** (`SubsquidSyncer::latest_block` is
+`transactions(orderBy: blockNumber_DESC, limit: 1)`, *not* the squid's height) is
+walked over `eth_getLogs` by `RpcSyncer` — whose own defaults are `batch_size:
+10` blocks and `batch_delay: 1000 ms`. That is **a fixed 100 ms per block of
+tail**, whatever the chain, the device or the network.
+
+The two device runs recorded further down this document say exactly that, twice:
+
+| run | fork block | `sync` |
+|---|---|---|
+| iPad Air 13-inch simulator | 11 719 354 | 140 045 ms |
+| iPad Air 4, physical | 11 720 020 | 220 815 ms |
+
+666 blocks further along the chain, **70 770 ms** more sync — 106 ms per block
+against the 100 ms/block the defaults spell out. Nothing about the device, the
+tree, the proof or the network differed between them; the RPC tail got 666
+blocks longer.
+
+`rust-lib/src/sync.rs` sets those two knobs through `RpcSyncer`'s own public
+`with_batch_size` / `with_batch_delay` — **1 000 blocks per request, no sleep**.
+No fork and no patch. Measured 2026-09-17 against public Sepolia through
+`ethereum-sepolia-rpc.publicnode.com`, the same cold sync run twice minutes
+apart (`the_tuning_is_worth_what_it_claims_on_the_real_chain`):
+
+```
+live-send: cold sync of the real Sepolia tree to block 11720459 / 11720461:
+  engine defaults (10/1000 ms) = 32006ms, #235 (1000/0 ms) = 8333ms
+```
+
+The tail that day was ~215 blocks, so ~21 s of the 24 s saved was sleep. **The
+saving is 100 ms per tail block and is unbounded**: on the day of the iPad run
+the tail was ~2 200 blocks, which is the 221 s. The deterministic form of the
+same claim is `sync::tests::the_tail_is_not_walked_ten_blocks_at_a_time` — the
+same 2 200-block range costs **3** `eth_getLogs` calls under this tuning and
+**220** (plus 220 s of sleep) under the engine's.
+
+**And the rest was incremental already; nobody was keeping the record.**
+`UtxoIndexer` persists `synced_block` after every `sync_to`, so a wallet built by
+`crate::engine` over a `DiskDatabase` syncs only the new blocks on its second
+send. What did not survive was the *probe's* state: `live_send` builds its engine
+over a `MemoryDatabase` deliberately (a probe leaves nothing behind), so a probe
+run re-walks the tail every time and its number is the COLD one. `sync::synced_block`
+reads that record back out of the KV database the engine writes it to — the
+engine exposes no getter — which is what makes `sync_status` free and the stepping
+resumable.
 
 ### `get_shielded_balance() → { ok, balances: [BalanceEntry] }`
 Per-asset shielded balance. Each entry is `{ asset: { erc20 }, amount, poiStatus }`.
@@ -347,9 +512,16 @@ this circuit are worth about 75 ms, and the replica's number was honest.
 quotes "1–2 minutes on mobile"; an A14 iPad does the whole compute half —
 witness plus proof plus verify — in about **1.3 s**. What dominates a *first*
 private send is the artifact download (≈3.2 s cold, ≈1.6 s warm, 3.5 MB), which
-is cacheable and is the network's number rather than the device's. A private
-send on iOS needs neither a background job nor a cancel path; a spinner over a
-one-off 3.5 MB fetch is the whole of the UI question.
+is cacheable and is the network's number rather than the device's.
+
+**That was the wrong conclusion about the WHOLE send (#235).** These are the
+PARTS. The whole operation was measured afterwards and it is 239 s on the same
+iPad, of which **221 s is the accumulator sync** and 3.6 s is everything on this
+page. A private send did need a progress surface and a cancel path — for the
+sync, never for the proof — and the sync needed the fix recorded under
+`sync_step` above. The sentence that used to end this paragraph ("a private send
+on iOS needs neither a background job nor a cancel path") was true of these
+numbers and false of the operation they are part of.
 
 **A short witness is refused rather than proven over.** `expected_witness_len`
 is ark-circom's own convention, not a guess: its zkey reader sets
@@ -690,8 +862,9 @@ verifier. `int:` on the chain id is not optional: the Shell's `--call` arguments
 are strings unless they say otherwise, and `patch_chain_endpoint(11155111, …)`
 is refused with `expected integer at arg0, got string`.
 
-**AND THE DRIVER CANNOT WAIT FOR IT.** `ShellCallDriver`'s per-call budget is
-60 000 ms and the send takes **154 s**, 140 s of which is the tree sync:
+**AND THE DRIVER COULD NOT WAIT FOR IT.** `ShellCallDriver`'s per-call budget
+was a fixed 60 000 ms and the send takes **154 s**, 140 s of which is the tree
+sync:
 
 ```
 [shell] CALL FAILED railgun_module.live_send_probe(str:{}): call to
@@ -707,8 +880,23 @@ whether a private send on iOS needs a progress UI and a cancel path, and could
 only answer for the witness (817 ms). This is the answer for the whole
 operation: **yes, and by a wide margin** — and the cost is not the proving
 (`transfer` = 3.7 s here, witness and Groth16 together, release build) but the
-one-off sync of the accumulator, which is the part a UI can show progress for
-and a user can be asked to wait through once.
+sync of the accumulator.
+
+**All three are fixed in #235.** The waiter has a budget: the Shell takes
+`--call-timeout <ms>` before a `--call` and it covers the calls after it, so
+
+```bash
+--call 'eth_rpc_module.init_defaults()' \
+--call-timeout 400000 \
+--call 'railgun_module.live_send_probe(str:{})'
+```
+
+waits for the send instead of reporting a failure for it, and a call that does
+run out now prints that it is STILL RUNNING. The sync has a progress surface and
+a resumable cancel (`sync_step` / `sync_status` / `sync_cancel`, above). And the
+sync itself is no longer 100 ms per block of RPC tail — see *Why the sync took
+221 seconds* under `sync_step`. The run below is therefore the record of the
+problem, not of the current cost.
 
 **What this is NOT.** The funds were conjured by the node, and the blocks were
 produced on this desk. `rootOnChain: true` here says the engine's tree agrees
@@ -806,7 +994,11 @@ is **3636 ms** (3912 ms on the second run) on the A14 under `wasmi`, against
 same three legs over placeholder values. The 239 s a private send takes on this
 handset is **221 s of accumulator sync**; the proving half is under 2 % of it.
 So a progress UI and a cancel path are needed for the SYNC, and #188's JIT-off
-patch costs the user nothing measurable.
+patch costs the user nothing measurable. **#235 built all three** — `sync_step`
+reports and resumes, and the 100 ms-per-block RPC tail that made the 221 s is
+gone (32 006 ms → 8 333 ms on the same cold sync of public Sepolia). The figure
+above is the measurement that found the problem; it is not what the same code
+costs now.
 
 **And `witnessBackend` is in the result, not only in the console.** The
 `railgun: witness store backend = …` line belongs to the vendored engine and

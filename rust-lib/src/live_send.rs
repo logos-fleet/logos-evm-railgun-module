@@ -109,6 +109,7 @@ use crate::keys;
 use crate::private_send::{PROBE_RECIPIENT_SEED, PROBE_SEED};
 use crate::proof_circuit::Leg;
 use crate::rpc_backend::{EthRpcEip1193, RpcBackend};
+use crate::sync::{self, Plan as SyncPlan, Tuning};
 
 alloy::sol! {
     function balanceOf(address owner) external view returns (uint256);
@@ -246,6 +247,13 @@ pub struct Run {
     pub approve_tx: Option<String>,
     pub shield_tx: Option<String>,
     pub shield_block: Option<u64>,
+    /// How many blocks the `sync` leg actually walked, and from where. The
+    /// `sync` leg's milliseconds mean nothing without them: a run whose
+    /// subsquid tail is 2 200 blocks and a run whose tail is 100 are not
+    /// comparable, and #235 was diagnosed by noticing that two runs 666 blocks
+    /// apart differed by 70 s of sync.
+    pub sync_from_block: Option<u64>,
+    pub sync_to_block: Option<u64>,
     /// The shielded balance AFTER a real sync of the real tree.
     pub balance: Option<u128>,
     pub transferred: Option<u128>,
@@ -704,8 +712,22 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     // ── the engine, over the REAL syncer and the real tree ─────────────────
     entering("engine");
     let t = Instant::now();
-    let build = RailgunBuilder::new(chain, eip1193.clone())
-        .with_database(Arc::new(MemoryDatabase::new()))
+    // THE SYNCER IS TUNED, and this is the leg #235 is about. See
+    // `crate::sync`: the engine's own `RpcSyncer` defaults walk whatever
+    // subsquid has not indexed ten blocks at a time with a one-second sleep
+    // after each -- 100 ms a block, which was 221 of the 239 seconds this probe
+    // took on a physical iPad Air 4.
+    //
+    // The database is held rather than handed over and forgotten: the engine
+    // persists `synced_block` into it and exposes no getter, so this is what
+    // lets the sync below be STEPPED and reported instead of being one opaque
+    // call. `MemoryDatabase` still, so a probe run leaves nothing behind -- and
+    // that also means this probe re-walks the tail every time, where a wallet
+    // built by `crate::engine` over a `DiskDatabase` walks only the new blocks.
+    let db = Arc::new(MemoryDatabase::new());
+    let build = RailgunBuilder::new(chain.clone(), eip1193.clone())
+        .with_database(db.clone())
+        .with_utxo_syncer(sync::utxo_syncer(&chain, eip1193.clone(), &Tuning::default()))
         .build()
         .await;
     let mut provider = match build {
@@ -790,11 +812,51 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     }
 
     // ── the sync: the whole of Sepolia's tree, our note among it ───────────
+    //
+    // IN WINDOWS, AND IT SAYS WHERE IT IS (#235). One `provider.sync()` is the
+    // same work and reports nothing for as long as it takes, which on a handset
+    // was 221 s of an unresponsive app. Each window persists before it returns,
+    // so a run interrupted here loses none of it -- and so does a USER who walks
+    // away, which is the whole of the cancel path: stop asking for the next one.
     entering("sync");
     let t = Instant::now();
-    if let Err(e) = provider.sync().await {
-        out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()), format!("sync: {e}")));
-        return out.finished(started);
+    let head = match eip1193.get_block_number().await {
+        Ok(b) => b,
+        Err(e) => {
+            out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()),
+                                      format!("eth_blockNumber: {e}")));
+            return out.finished(started);
+        }
+    };
+    // The account whose record says how far the sync has got -- this probe's own
+    // `0zk`, the one `sync::synced_block` takes the minimum against.
+    let zk_address = from.to_string();
+    let mut plan = SyncPlan::new(sync::synced_block(db.as_ref(), Some(&zk_address)).await, head);
+    // The subsquid half in one window -- see `sync::subsquid_frontier`.
+    if let Some(frontier) = sync::subsquid_frontier(&chain).await {
+        plan = plan.with_fast_forward(frontier);
+    }
+    out.sync_from_block = Some(plan.start_block);
+    out.sync_to_block = Some(plan.target_block);
+    while let Some(end) = plan.next_window_end(sync::DEFAULT_WINDOW_BLOCKS) {
+        let before = plan.synced_block;
+        let (result, ms) = sync::timed(provider.sync_to(end)).await;
+        if let Err(e) = result {
+            out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()), format!("sync: {e}")));
+            return out.finished(started);
+        }
+        plan.record(sync::synced_block(db.as_ref(), Some(&zk_address)).await, ms);
+        sync::report(&plan);
+        if plan.synced_block <= before {
+            // The engine will not pass this block, so neither will another turn
+            // of this loop. Say where it stopped rather than spinning.
+            out.legs.push(Leg::failed(
+                "sync",
+                Some(t.elapsed().as_millis()),
+                format!("sync stalled at block {} of {}", plan.synced_block, plan.target_block),
+            ));
+            return out.finished(started);
+        }
     }
     out.legs.push(Leg::timed("sync", Some(t.elapsed().as_millis())));
 
@@ -957,8 +1019,8 @@ pub fn summary(r: &Run) -> String {
         "railgun_module: live-send probe: {} (chain={} node={:?}{} witnessBackend={:?} eoa={:?} \
          circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} \
          shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
-         approve={:?}ms shield={:?}ms sync={:?}ms balance={:?}ms transfer={:?}ms broadcast={:?}ms \
-         total={}ms)",
+         approve={:?}ms shield={:?}ms sync={:?}ms/{:?}blocks balance={:?}ms transfer={:?}ms \
+         broadcast={:?}ms total={}ms)",
         if r.ok() { "SENT" } else { "DID NOT" },
         r.chain_id,
         r.node,
@@ -980,6 +1042,7 @@ pub fn summary(r: &Run) -> String {
         leg("approve"),
         leg("shield"),
         leg("sync"),
+        r.sync_from_block.zip(r.sync_to_block).map(|(from, to)| to.saturating_sub(from)),
         leg("balance"),
         leg("transfer"),
         leg("broadcast"),
@@ -1414,6 +1477,39 @@ mod tests {
         }
     }
 
+    /// Sync the real Sepolia tree once under `tuning`, and say what it cost.
+    /// Returns `(engine_ms, sync_ms, from_block, to_block, shielded)`.
+    fn sync_real_sepolia_once(tuning: Tuning) -> (u128, u128, u64, u64, u128) {
+        let chain = ChainConfig::sepolia();
+        let eip1193: Arc<dyn Eip1193Provider> = Arc::new(EthRpcEip1193::new(RealSepolia::new()));
+        let (spend, view) = keys::derive_keys_from_seed(PROBE_SEED);
+        let signer = keys::make_signer(&spend, &view, ChainId::evm(SEPOLIA)).expect("keys");
+        let started = Instant::now();
+        block_on(async {
+            let db = Arc::new(MemoryDatabase::new());
+            let mut provider = RailgunBuilder::new(chain.clone(), eip1193.clone())
+                .with_database(db.clone())
+                .with_utxo_syncer(sync::utxo_syncer(&chain, eip1193.clone(), &tuning))
+                .build()
+                .await
+                .expect("engine");
+            provider
+                .register(signer.clone() as Arc<dyn RailgunSigner>)
+                .await
+                .expect("register");
+            let built = started.elapsed().as_millis();
+            let address = signer.address().to_string();
+            let from = sync::synced_block(db.as_ref(), Some(&address)).await;
+            let t = Instant::now();
+            provider.sync().await.expect("sync");
+            let synced = t.elapsed().as_millis();
+            let to = sync::synced_block(db.as_ref(), Some(&address)).await;
+            let balance: u128 =
+                provider.balance(signer.address()).await.iter().map(|b| b.amount).sum();
+            (built, synced, from, to, balance)
+        })
+    }
+
     // CAN THE ENGINE SYNC THE REAL TREE AT ALL? This needs no funds and no
     // proving, and it is the leg with nothing to fall back on: the shielded
     // balance of a real note is read out of a tree the engine builds from every
@@ -1424,42 +1520,60 @@ mod tests {
     #[test]
     #[ignore = "needs the network and syncs the whole Sepolia UTXO tree"]
     fn the_engine_syncs_the_real_sepolia_tree() {
-        let chain = ChainConfig::sepolia();
-        let eip1193: Arc<dyn Eip1193Provider> = Arc::new(EthRpcEip1193::new(RealSepolia::new()));
-        let (spend, view) = keys::derive_keys_from_seed(PROBE_SEED);
-        let signer = keys::make_signer(&spend, &view, ChainId::evm(SEPOLIA)).expect("keys");
-        let started = Instant::now();
-        let out = block_on(async {
-            let mut provider = RailgunBuilder::new(chain, eip1193)
-                .with_database(Arc::new(MemoryDatabase::new()))
-                .build()
-                .await
-                .expect("engine");
-            provider
-                .register(signer.clone() as Arc<dyn RailgunSigner>)
-                .await
-                .expect("register");
-            let built = started.elapsed().as_millis();
-            let t = Instant::now();
-            provider.sync().await.expect("sync");
-            let synced = t.elapsed().as_millis();
-            let balance: u128 = provider
-                .balance(signer.address())
-                .await
-                .iter()
-                .map(|b| b.amount)
-                .sum();
-            (built, synced, balance)
-        });
+        let (built, synced, from, to, balance) = sync_real_sepolia_once(Tuning::default());
         // Printed rather than asserted: the balance is 0 until an operator funds
         // the EOA and a run shields, and this test is about the SYNC completing.
         eprintln!(
-            "live-send: real Sepolia sync: engine={}ms sync={}ms shielded={} (probe {})",
-            out.0,
-            out.1,
-            out.2,
-            signer.address()
+            "live-send: real Sepolia sync: engine={built}ms sync={synced}ms \
+             blocks={from}..{to} ({} blocks) shielded={balance}",
+            to.saturating_sub(from)
         );
+        assert!(to > from, "it synced nothing");
+    }
+
+    // AND WHAT IT COST BEFORE #235, ON THE SAME CHAIN, IN THE SAME SESSION.
+    //
+    // The engine's own `RpcSyncer` defaults -- 10 blocks per `eth_getLogs` with
+    // a 1 000 ms sleep after each -- are the 221 s a private send spent syncing
+    // on a physical iPad Air 4. This runs the identical cold sync twice, untuned
+    // then tuned, minutes apart on the same chain, so the two numbers are
+    // comparable in a way two runs on two days are not.
+    //
+    // WHAT IT SAVES IS 100 ms PER BLOCK OF **TAIL** -- the blocks after the last
+    // RAILGUN transaction subsquid has indexed, which is what `SubsquidSyncer`
+    // reports as its latest block. Everything before that comes out of subsquid
+    // in 20 000-item pages and is the same either way, so the ABSOLUTE saving is
+    // whatever the tail happens to be when you run this: measured 2026-09-17
+    // against `ethereum-sepolia-rpc.publicnode.com`, a ~210-block tail,
+    //
+    //   before=31273ms  after=8192ms
+    //
+    // and on the day of the iPad run the tail was ~2 200 blocks, which is the
+    // 221 s. The assertion is therefore only that the tuning never costs MORE:
+    // a run on a chain whose tail is empty saves nothing and must not go red for
+    // it. The ratio is the printed number, and
+    // `sync::tests::the_tail_is_not_walked_ten_blocks_at_a_time` is the
+    // deterministic form of the same claim (220 requests against 3).
+    //
+    // `#[ignore]` for the network AND for the wall clock: the untuned half takes
+    // as long as the tail is deep, which is the point being made.
+    //
+    //   cargo test --features engine_seam -- --ignored --nocapture the_tuning_is_worth
+    #[test]
+    #[ignore = "needs the network; the untuned half takes as long as the tail is deep"]
+    fn the_tuning_is_worth_what_it_claims_on_the_real_chain() {
+        let untuned = Tuning { rpc_batch_blocks: 10, rpc_batch_delay_ms: 1_000 };
+        let (_, before_ms, _, before_to, _) = sync_real_sepolia_once(untuned);
+        let (_, after_ms, _, after_to, _) = sync_real_sepolia_once(Tuning::default());
+        eprintln!(
+            "live-send: cold sync of the real Sepolia tree to block {before_to} / {after_to}: \
+             engine defaults ({}/{} ms) = {before_ms}ms, #235 ({}/{} ms) = {after_ms}ms",
+            untuned.rpc_batch_blocks,
+            untuned.rpc_batch_delay_ms,
+            Tuning::default().rpc_batch_blocks,
+            Tuning::default().rpc_batch_delay_ms,
+        );
+        assert!(after_ms <= before_ms, "before={before_ms}ms after={after_ms}ms");
     }
 
     // WOULD A REAL NODE TAKE THIS TRANSACTION? The signature is the one part of
