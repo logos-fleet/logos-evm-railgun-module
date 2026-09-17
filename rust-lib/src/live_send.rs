@@ -86,7 +86,7 @@
 //! contracts, the tree and `rootOnChain`, and the client version is the only
 //! thing that tells them apart.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy::consensus::{SignableTransaction, TxEip1559};
@@ -293,6 +293,24 @@ impl Run {
 
     pub fn leg(&self, name: &str) -> Option<&Leg> {
         self.legs.iter().find(|l| l.name == name)
+    }
+
+    /// Record `name` as the leg `r` turned out to be, timed from `t`: a value
+    /// passes through, an error becomes a RED leg and `None`. Callers stop on
+    /// the `None`, so a leg is written exactly once and a failure is timed
+    /// where it happened rather than being reported as an untimed one.
+    fn record_leg<T>(&mut self, name: &'static str, t: Instant, r: Result<T, String>) -> Option<T> {
+        let ms = Some(t.elapsed().as_millis());
+        match r {
+            Ok(v) => {
+                self.legs.push(Leg::timed(name, ms));
+                Some(v)
+            }
+            Err(e) => {
+                self.legs.push(Leg::failed(name, ms, e));
+                None
+            }
+        }
     }
 
     /// The wasm backend the ENGINE generates its witness on in THIS image —
@@ -610,6 +628,12 @@ pub struct RootCheck {
     pub on_chain: bool,
 }
 
+/// A `bool` as an `eth_call` answers one: a 32-byte word, true when any bit of
+/// it is set — which is how the ABI decoder reads it too.
+fn word_is_true(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| !s.trim_start_matches("0x").trim_start_matches('0').is_empty())
+}
+
 /// An [`RpcBackend`] that passes everything through and remembers the last
 /// [`RootCheck`] the engine made against `smart_wallet`.
 ///
@@ -622,12 +646,12 @@ pub struct RootCheck {
 pub struct RootWatch<B: RpcBackend> {
     inner: Arc<B>,
     smart_wallet: Address,
-    last: std::sync::Mutex<Option<RootCheck>>,
+    last: Mutex<Option<RootCheck>>,
 }
 
 impl<B: RpcBackend> RootWatch<B> {
     pub fn new(inner: Arc<B>, smart_wallet: Address) -> Self {
-        Self { inner, smart_wallet, last: std::sync::Mutex::new(None) }
+        Self { inner, smart_wallet, last: Mutex::new(None) }
     }
 
     /// The last root the engine checked. `None` when it checked none, which is
@@ -640,7 +664,7 @@ impl<B: RpcBackend> RootWatch<B> {
     /// `[{ "to": …, "data": … }, "latest"]`, as `EthRpcEip1193::eth_call` writes
     /// it, decoded back into the call the engine made. `None` for every other
     /// `eth_call` — a run makes many, and only this one is about a root.
-    fn decode(&self, params: &Value) -> Option<(u32, U256)> {
+    fn decode_root_history(&self, params: &Value) -> Option<(u32, U256)> {
         let call = params.get(0)?;
         let to = call.get("to")?.as_str()?.parse::<Address>().ok()?;
         if to != self.smart_wallet {
@@ -654,16 +678,11 @@ impl<B: RpcBackend> RootWatch<B> {
 
 impl<B: RpcBackend> RpcBackend for RootWatch<B> {
     fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
-        let asked = (method == "eth_call").then(|| self.decode(&params)).flatten();
+        let asked = if method == "eth_call" { self.decode_root_history(&params) } else { None };
         let answer = self.inner.rpc(method, params);
         if let (Some((tree, root)), Ok(v)) = (asked, &answer) {
-            // A `bool` comes back as a 32-byte word: anything that is not all
-            // zeroes is true, which is how the ABI decoder reads it too.
-            let on_chain = v
-                .as_str()
-                .is_some_and(|s| !s.trim_start_matches("0x").trim_start_matches('0').is_empty());
             *self.last.lock().expect("the watch is never held across a panic") =
-                Some(RootCheck { tree, root, on_chain });
+                Some(RootCheck { tree, root, on_chain: word_is_true(v) });
         }
         answer
     }
@@ -798,16 +817,8 @@ async fn survey<B: RpcBackend>(
     entering("engine");
     let t = Instant::now();
     let db = Arc::new(MemoryDatabase::new());
-    let mut provider = match build_engine(chain, eip1193.clone(), db.clone(), signer).await {
-        Ok(p) => {
-            out.legs.push(Leg::timed("engine", Some(t.elapsed().as_millis())));
-            p
-        }
-        Err(e) => {
-            out.legs.push(Leg::failed("engine", Some(t.elapsed().as_millis()), e));
-            return;
-        }
-    };
+    let built = build_engine(chain, eip1193.clone(), db.clone(), signer).await;
+    let Some(mut provider) = out.record_leg("engine", t, built) else { return };
 
     entering("sync");
     let t = Instant::now();
@@ -818,19 +829,14 @@ async fn survey<B: RpcBackend>(
         out.sync_from_block = Some(plan.start_block);
         out.sync_to_block = Some(plan.target_block);
     }
-    if let Err(e) = synced {
-        out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()), e));
+    if out.record_leg("sync", t, synced).is_none() {
         return;
     }
-    out.legs.push(Leg::timed("sync", Some(t.elapsed().as_millis())));
 
     let t = Instant::now();
-    match record_root_check(out, watch) {
-        Ok(()) => out.legs.push(Leg::timed("synced-root", Some(t.elapsed().as_millis()))),
-        Err(e) => {
-            out.legs.push(Leg::failed("synced-root", Some(t.elapsed().as_millis()), e));
-            return;
-        }
+    let checked = record_root_check(out, watch);
+    if out.record_leg("synced-root", t, checked).is_none() {
+        return;
     }
 
     entering("balance");
@@ -908,6 +914,9 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     };
     let from = signer.address();
     let to = recipient.address();
+    // The engine takes the signer as a trait object, and either a send or a
+    // survey hands it over -- coerced once here rather than at both call sites.
+    let engine_signer: Arc<dyn RailgunSigner> = signer.clone();
     out.from = Some(from.to_string());
     out.to = Some(to.to_string());
     out.legs.push(Leg::timed("keys", None));
@@ -952,15 +961,8 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             // NOT THE END OF THE RUN. Nothing past here can be signed, but the
             // chain reads cost nothing and the sync is the leg that dominates a
             // private send -- see `survey`.
-            survey(
-                &mut out,
-                &chain,
-                eip1193.clone(),
-                watch.as_ref(),
-                signer.clone() as Arc<dyn RailgunSigner>,
-                from.clone(),
-            )
-            .await;
+            survey(&mut out, &chain, eip1193.clone(), watch.as_ref(), engine_signer, from.clone())
+                .await;
             return out.finished(started);
         }
     };
@@ -996,21 +998,10 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     entering("engine");
     let t = Instant::now();
     let db = Arc::new(MemoryDatabase::new());
-    let engine = build_engine(
-        &chain,
-        eip1193.clone(),
-        db.clone(),
-        signer.clone() as Arc<dyn RailgunSigner>,
-    )
-    .await;
-    let mut provider = match engine {
-        Ok(p) => p,
-        Err(e) => {
-            out.legs.push(Leg::failed("engine", Some(t.elapsed().as_millis()), e));
-            return out.finished(started);
-        }
+    let built = build_engine(&chain, eip1193.clone(), db.clone(), engine_signer).await;
+    let Some(mut provider) = out.record_leg("engine", t, built) else {
+        return out.finished(started);
     };
-    out.legs.push(Leg::timed("engine", Some(t.elapsed().as_millis())));
 
     // ── approve, if the smart wallet may not already move the tokens ───────
     entering("approve");
@@ -1092,20 +1083,17 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
         out.sync_from_block = Some(plan.start_block);
         out.sync_to_block = Some(plan.target_block);
     }
-    if let Err(e) = synced {
-        out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()), e));
+    if out.record_leg("sync", t, synced).is_none() {
         return out.finished(started);
     }
-    out.legs.push(Leg::timed("sync", Some(t.elapsed().as_millis())));
 
     // And the verdict the engine asked for and threw away -- read BEFORE the
     // `root-on-chain` leg below asks its own question through the same watch.
     let t = Instant::now();
-    if let Err(e) = record_root_check(&mut out, watch.as_ref()) {
-        out.legs.push(Leg::failed("synced-root", Some(t.elapsed().as_millis()), e));
+    let checked = record_root_check(&mut out, watch.as_ref());
+    if out.record_leg("synced-root", t, checked).is_none() {
         return out.finished(started);
     }
-    out.legs.push(Leg::timed("synced-root", Some(t.elapsed().as_millis())));
 
     // ── a shielded balance a transaction put there ─────────────────────────
     entering("balance");
