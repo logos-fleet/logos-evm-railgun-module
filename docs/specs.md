@@ -724,6 +724,70 @@ confident `false`.
 error naming the block — the RPC call succeeded and every field is present, which
 is exactly the shape of answer a probe reports as success by accident.
 
+#### ✅ THE PUBLIC CHAIN, ON THE PHYSICAL iPad, FUNDED AND MINED (#213 clause 1)
+
+**2026-09-17.** The operator's one transfer landed on
+`0x23cc2752F664Bf465A3631253687712b222B1722`, and the whole private send ran
+**unattended** on the venue's physical **iPad Air (4th generation)**, release
+build, Bundled set `railgun_module` + `capability_module`, against **public
+Sepolia** — `reth/v2.4.1`, `forked: false`. No fork, no tunnel, no anvil.
+
+```
+railgun_module: live-send probe: SENT (chain=11155111
+  node=Some("reth/v2.4.1-8eb2101/x86_64-unknown-linux-gnu")
+  witnessBackend="wasmi" eoa=Some("0x23cc…1722") circuit=Some("01x02")
+  shielded=Some(99750000000000) transferred=Some(49875000000000)
+  rootOnChain=Some(true) syncedRootOnChain=Some(true)
+  asset=Some("erc20:0xfff9…6b14") wrappedWei=Some(100000000000000)
+  feeWeiPerGas=Some(1361034287)
+  shieldTx=Some("0xafa62f34…95aa") transferTx=Some("0x2d2c777a…fb80")
+  calldata=Some(1956)B
+  engine=Some(5)ms sync=Some(5241)ms/Some(11723144)blocks funding=Some(414)ms
+  wrap=Some(10985)ms approve=Some(13140)ms shield=Some(11440)ms
+  resync=Some(772)ms transfer=Some(4198)ms broadcast=Some(6903)ms total=53411ms)
+```
+
+and, from inside the **vendored** `calculate_witness`, immediately before the
+`transfer` leg:
+
+```
+railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)
+```
+
+**The receipts, read back off the public chain rather than off the device:**
+
+| | tx | block | status | gas | to |
+|---|---|---|---|---|---|
+| shield | `0xafa62f34…95aa` | 11 723 148 | `0x1` | **730 311** | `0xeCFCf3b4…3fea` |
+| proved `transact(...)` | `0x2d2c777a…fb80` | 11 723 149 | `0x1` | **1 002 375** | `0xeCFCf3b4…3fea` |
+
+A proof the contract's verifier rejects costs a `status 0x0`, so a green
+`broadcast` leg is **the RAILGUN contract's own verdict on a Groth16 proof an
+A14 iPad produced on the `wasmi` interpreter** — over a note that iPad's shield
+transaction had put in that contract's tree four seconds earlier. The EOA's
+nonce went 0 → 4 (wrap, approve, shield, transact). The venue keystore account
+`0x493A73e8…DEEa` was **not touched**: 0.05 ETH, nonce 0, re-read after the run.
+
+**AND THE SECOND RUN REUSED THE NOTE, on the same chain and the same iPad** —
+see "a mined shield survives the run that made it" below:
+
+```
+railgun_module: live-send probe: SENT (chain=11155111 node=Some("reth/v2.4.1…")
+  REUSED-A-MINED-SHIELD witnessBackend="wasmi" circuit=Some("01x02")
+  shielded=Some(49875000000000) transferred=Some(24937500000000)
+  rootOnChain=Some(true) syncedRootOnChain=Some(true)
+  wrappedWei=None shieldTx=None transferTx=Some("0x19b167a5…6bd9")
+  feeWeiPerGas=Some(1355131969)
+  engine=Some(4)ms sync=Some(4499)ms funding=Some(419)ms wrap=Nonems
+  approve=Nonems shield=Nonems resync=Nonems transfer=Some(4261)ms
+  broadcast=Some(8978)ms total=18474ms)
+```
+
+`0x19b167a5…6bd9`: block 11 723 166, `status 0x1`, **1 008 262** gas, to the
+same contract — one transaction instead of four, **18 474 ms instead of
+53 411**, and no second shield. That is the whole of this probe's second run:
+the change note the first one left, spent.
+
 #### It signs with an EOA of its own, and that key is public
 
 A shield is an ordinary transaction and needs an ordinary signature, and the
@@ -803,7 +867,10 @@ mean the same thing in both: `100000` units (0.1 USDC, 6 decimals) for an ERC-20
 already held, `100000000000000` wei (0.0001 ETH, 18 decimals) for the wrapped
 base token it mints. `transfer` defaults to **half of whatever the engine reports
 as shielded**, which keeps a change note (and so the `01x02` circuit the other
-two probes measured) whatever the RAILGUN shield fee took.
+two probes measured) whatever the RAILGUN shield fee took. `shield` has **no
+effect on a run that reuses a note** — there is nothing to shield — which is
+deliberate: the alternative is a caller who passes it after a failure paying for
+a second shield because of a number they meant as a default.
 
 #### THE OPERATOR ASK IS A PRICE, NOT A CONSTANT — and a constant stranded a shield
 
@@ -928,6 +995,13 @@ SENT … REUSED-A-MINED-SHIELD  shieldTx=None wrappedWei=None
 The second run sends the **change note** the first one left, its proof is built
 over a root the contract confirms, and the RAILGUN contract mines it — out of a
 purse that could not have started a fresh run.
+
+**And then on the PUBLIC chain, on the physical iPad**, which is where it
+counts: the funded run above shielded and sent, and the run after it reused the
+change note — `shieldTx: None`, `reusedNote: true`, one transaction instead of
+four, `0x19b167a5…6bd9` mined by the RAILGUN contract in block 11 723 166. The
+whole send went from **53 411 ms to 18 474 ms**, and the ask for it from
+`price_run` (0.0102 ETH at that fee) to `price_spend` (0.0077).
 
 #### `syncedRootOnChain`: the verdict the engine asks for and throws away
 
@@ -1359,25 +1433,21 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   artifact source is an upstream-contributable `with_artifact_loader` hook, not a
   fork. Until then, proving (`prepare_transfer`/`prepare_unshield`/`relayed_send`)
   needs network reachability to that source.
-- **Nothing has been sent on the PUBLIC chain (#213 clause 1).** The whole
-  private send — shield mined, sync, the engine's own `calculate_witness`,
-  Groth16 prove and verify, `rootOnChain` true, and the proved `transact(...)`
-  mined by the RAILGUN contract — runs end to end on the physical iPad Air 4,
-  but against `anvil --fork-url <sepolia>`, and every such run says so with
-  `FORK-NOT-PUBLIC-SEPOLIA`. What the public chain adds is that the ETH and the
-  blocks were not local, and it is **one operator transfer**: Sepolia ETH to
-  `0x23cc2752F664Bf465A3631253687712b222B1722` (the probe mints its own ERC-20
-  out of it), in the amount the run's own `needsFunding` prints — ≈ 0.0070 ETH at
-  a 1 gwei base fee, and 0.02 is comfortable at any fee this chain has shown. No
-  agent at this venue can obtain testnet funds, and the venue's own funded
-  account cannot sign for one — keystore signing is a human
-  `approve(handle, bundle_id, password)` and the vault password is not an
-  agent's to have. Until then an unfunded run **surveys** the public chain
-  instead of stopping: engine, a sync of the real accumulator to the live tip,
-  and `syncedRootOnChain` true — measured on the handset, 3.9 s. And a run that
-  mines its shield and then fails no longer costs a second one: the next run
-  spends the note already in the tree, for the price of the `transact(...)`
-  alone (`reusedNote`, above).
+- ~~**Nothing has been sent on the PUBLIC chain (#213 clause 1).**~~ **CLOSED
+  2026-09-17.** The whole private send — shield mined in block 11 723 148, sync,
+  the engine's own `calculate_witness` on `wasmi`, Groth16 prove and verify,
+  `rootOnChain` true, and the proved `transact(...)` mined by the RAILGUN
+  contract in block 11 723 149 — ran on the physical iPad Air 4 against **public
+  Sepolia**, unattended, off one operator transfer to
+  `0x23cc2752F664Bf465A3631253687712b222B1722`. See the section above for the
+  console lines and the receipts. What remains here is only the running cost:
+  the EOA is now the fixture that has to stay topped up, and the run prints its
+  own ask (`needsFunding`, priced off `eth_gasPrice`). A run that has a note in
+  the tree asks for **the transact alone** rather than a whole run, so a send
+  that dies past its shield costs one top-up and not a second shield.
+  An **unfunded** run still surveys the public chain instead of stopping:
+  engine, a sync of the real accumulator to the live tip, and
+  `syncedRootOnChain` true — measured on the handset, 3.9 s.
 - **Canonical recovery**: `init_from_seed` is not yet RAILGUN-Community BIP-32.
 - **UserOp status**: `relayed_send_status` returns the `userOpHash` once the
   operation is submitted; polling its receipt (`eth_getUserOperationReceipt`) is

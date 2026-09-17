@@ -1,4 +1,13 @@
-//! THE PRIVATE SEND THE CHAIN ITSELF WITNESSED — #213's remaining clause.
+//! THE PRIVATE SEND THE CHAIN ITSELF WITNESSED — #213's last clause, CLOSED.
+//!
+//! On 2026-09-17, on the venue's physical iPad Air (4th generation), against
+//! PUBLIC Sepolia (`reth/v2.4.1`, `forked: false`), this probe wrapped,
+//! allowed, **shielded** (mined in block 11 723 148, `status 0x1`, 730 311 gas),
+//! synced the real accumulator, proved through the engine's own
+//! `calculate_witness` on the `wasmi` interpreter, and had the RAILGUN contract
+//! **mine the proved `transact(...)`** in block 11 723 149 (`status 0x1`,
+//! 1 002 375 gas). 53 411 ms end to end. The receipts are on the public chain
+//! and in `docs/specs.md`.
 //!
 //! ## What was still missing after the second #213 cycle
 //!
@@ -14,17 +23,21 @@
 //! This module removes that last substitution. Nothing here is fabricated:
 //!
 //! ```text
-//!   funding   how much ETH and ERC-20 the probe's own EOA holds, read off chain
-//!   wrap      `deposit()` on the chain's wrapped base token, so ETH alone is
-//!             enough to fund a run -- skipped when an ERC-20 is already held
 //!   engine    RailgunBuilder over the DEFAULT syncer (subsquid, then RPC) --
 //!             i.e. the real Sepolia tree, not a syncer we wrote
+//!   sync      the engine syncs to tip, beside every other shield anyone ever
+//!             made on this chain
+//!   balance   what that tree already holds for this probe -- the input to the
+//!             funding decision, which is why the free half goes FIRST
+//!   funding   how much ETH and ERC-20 the probe's own EOA holds, read off chain
+//!   wrap      `deposit()` on the chain's wrapped base token, so ETH alone is
+//!             enough to fund a run -- skipped when an ERC-20 is already held,
+//!             and whenever a note is being reused
 //!   approve   ERC-20 approve(RailgunSmartWallet, amount), SIGNED AND BROADCAST
 //!   shield    the ENGINE's own ShieldBuilder calldata, SIGNED AND BROADCAST,
 //!             waited on until a block carries it
-//!   sync      the engine syncs to tip and finds ITS OWN note in the contract's
-//!             tree, beside every other shield anyone ever made on this chain
-//!   balance   a shielded balance that a transaction put there
+//!   resync    the blocks since, the shield's own among them
+//!   note      a shielded balance that a transaction put there
 //!   transfer  TransactionBuilder -> circuit inputs -> calculate_witness ->
 //!             Groth16Prover::prove and verify, over the CONTRACT's merkle root
 //!   root      RailgunSmartWallet.rootHistory(tree, root) -- expected TRUE here,
@@ -68,7 +81,17 @@
 //!
 //! Until the ETH lands every run stops at the `funding` leg and reports the ask,
 //! which is a complete handoff rather than a failure: the address is fixed, so
-//! the funding is a one-time step and every later run is unattended.
+//! the funding is a one-time step and every later run is unattended. It landed:
+//! the runs above are unattended runs off one operator transfer.
+//!
+//! AND THE SECOND RUN COSTS LESS THAN THE FIRST, because a mined shield does not
+//! come back. Where the tree already holds one of this probe's notes there is
+//! nothing to wrap, allow or shield: [`plan`] answers [`Plan::Spend`], the ask
+//! shrinks to [`price_spend`] — what the proved `transact(...)` alone reserves —
+//! and the run goes straight from the sync to the proof. That is what makes an
+//! operator's single transfer survive a run that dies past its shield, which is
+//! a real failure mode: #243 reproduced one, on a fork, with the shield mined
+//! and the broadcast refused for funds.
 //!
 //! HOW MUCH is [`price_run`], read off the chain, rather than a constant. What
 //! decides a run is not what its four transactions spend but what EIP-1559 makes
@@ -338,6 +361,11 @@ pub struct Params {
     /// [`DEFAULT_SHIELD`] for an ERC-20 the EOA already holds and
     /// [`DEFAULT_WRAP_SHIELD`] for the 18-decimal wrapped base token, since one
     /// number cannot mean the same thing in both.
+    ///
+    /// Has NO effect on a run that reuses a note ([`Plan::Spend`]): there is
+    /// nothing to shield. Deliberate -- the alternative is a caller who passes
+    /// it after a failure paying for a second shield because of a number they
+    /// meant as a default.
     pub shield: Option<u128>,
     /// `None` = half of whatever the engine reports as shielded, which keeps the
     /// operation at one nullifier and two commitments (`01x02`) whatever the
