@@ -676,7 +676,7 @@ LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
   `no configuration for chain 11155111`. `init_defaults()` is idempotent and
   persists, so it is needed on the first launch only.
 
-### `live_send_probe(params_json) → { ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits, needsFunding, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx, shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
+### `live_send_probe(params_json) → { ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits, needsFunding, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx, shieldBlock, syncFromBlock, syncToBlock, balance, transferred, circuit, rootOnChain, syncedTree, syncedRoot, syncedRootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
 **The same send with NOTHING substituted: on chain, mined, and accepted by the
 contract** (#213 acceptance clause 1).
 
@@ -695,7 +695,8 @@ verifies the Groth16 proof the device produced.
 | `engine` | `RailgunBuilder::build` over a `MemoryDatabase` and the **default** syncer (subsquid, then RPC): the real chain's events, not a syncer we wrote |
 | `approve` | ERC-20 `approve(RailgunSmartWallet, amount)` — signed, broadcast, waited on. Skipped where the allowance already covers it |
 | `shield` | the ENGINE's own `ShieldBuilder` calldata — signed, broadcast, waited on |
-| `sync` | the engine finds its own note in the contract's tree, beside every other shield ever made on this chain |
+| `sync` | the engine finds its own note in the contract's tree, beside every other shield ever made on this chain. Stepped and reported (#235) |
+| `synced-root` | `syncedRootOnChain`: the root the engine synced TO, checked against the contract — the verdict the engine asks for and throws away, see below |
 | `balance` | a shielded balance a **transaction** put there |
 | `transfer` | `TransactionBuilder` → circuit inputs → the engine's own `calculate_witness` → `Groth16Prover::prove` **and verify** |
 | `root-on-chain` | `RailgunSmartWallet.rootHistory(tree, root)` — expected **true**, and a `false` here FAILS the leg rather than being reported as a limit |
@@ -757,11 +758,24 @@ So `plan` (pure, and unit-tested without a chain) decides in this order:
 6. otherwise → ask, in ETH: `MIN_GAS_WEI + DEFAULT_WRAP_SHIELD`
    = `5100000000000000` wei ≈ **0.0051 ETH** (0.01 is comfortable).
 
-#### Until it is funded, a run is a handoff rather than a crash
+#### Until it is funded, a run SURVEYS the chain and then hands off
 
-The `funding` leg stops the run and reports `needsFunding` — the address, what it
-holds, and what it needs — before an engine is built or anything is signed. The
-address is fixed, so funding it is a one-time operator step.
+The `funding` leg goes red and reports `needsFunding` — the address, what it
+holds, and what it needs. The address is fixed, so funding it is a one-time
+operator step.
+
+**It does not stop there.** Nothing a sync does costs anything, so an unfunded
+run carries straight on into every leg money is not needed for: `engine` over the
+real default syncer, `sync` of the real accumulator to the **live** tip,
+`synced-root`, and `balance`. The first signature is the line it will not cross.
+`ok` stays **false**, the `funding` leg stays red, and the summary line says
+`DID NOT` and `SURVEY-ONLY-UNFUNDED` — a survey is not a send and must not read
+like one.
+
+That is worth having because the sync is the leg that dominates a private send
+(221 s of 239 before #235 tuned it) and, until this, every measurement of it came
+from a **local fork**: a node on the same desk whose tip does not move while the
+walk runs. A survey measures it on the chain it will really run against.
 
 `{ "asset"?: "0x…", "shield"?: "100000", "transfer"?: decimal, "memo"?: string,
 "broadcast"?: bool, "confirmMs"?: u64 }` — all optional, so `live_send_probe()`
@@ -772,10 +786,92 @@ base token it mints. `transfer` defaults to **half of whatever the engine report
 as shielded**, which keeps a change note (and so the `01x02` circuit the other
 two probes measured) whatever the RAILGUN shield fee took.
 
+#### `syncedRootOnChain`: the verdict the engine asks for and throws away
+
+At the end of every `sync_to` the engine verifies each tree it has just written
+against the deployed `RailgunSmartWallet`. `UtxoIndexer::verify` propagates an
+RPC **error** and **drops the `bool`** (kohaku `96c835f`,
+`crates/railgun/src/indexer/utxo_indexer.rs`), so an engine whose tree has
+diverged from the contract's syncs **green** and the failure surfaces 200 s later
+as a reverted `transact(...)` — or, on an unfunded run, not at all.
+
+`RootWatch` is an `RpcBackend` decorator around the provider this module hands
+the engine: it lets every call through and remembers the last
+`rootHistory(treeNumber, root)` made to the smart wallet, with the answer. No
+seam, no extra round trip, and it is the **engine's own** root at the moment the
+engine had it rather than one re-derived afterwards. `record_root_check` reports
+it as `syncedTree` / `syncedRoot` / `syncedRootOnChain` and **fails the run on a
+`false`**.
+
+It is not the same claim as `rootOnChain`, which is about the root a **proof** was
+built over and therefore needs a shielded balance and money. This one says the
+accumulator this device rebuilt out of chain events is, leaf for leaf, the one the
+contract holds — which is the part of clause 1 an unfunded run can still answer.
+
+#### THE PUBLIC CHAIN, ON THE PHYSICAL iPad, WITH NO FUNDS AT ALL
+
+iPad Air (4th generation), release build, Bundled set `railgun_module` +
+`capability_module`, `eth_rpc_module` on its shipped Sepolia default
+(`https://ethereum-sepolia-rpc.publicnode.com`) — no fork, no tunnel, no anvil:
+
+```
+railgun_module: live-send probe: DID NOT (chain=11155111
+  node=Some("reth/v2.4.1-8eb2101/x86_64-unknown-linux-gnu") SURVEY-ONLY-UNFUNDED
+  witnessBackend="wasmi" eoa=Some("0x23cc…1722") shielded=Some(0)
+  syncedRootOnChain=Some(true) funding=Some(188)ms engine=Some(5)ms
+  sync=Some(3977)ms/Some(11721785)blocks balance=Some(0)ms total=4260ms)
+```
+
+`node` is a **reth**, so `forked` is false: this is public Sepolia and not a
+chain on this desk. `syncedRoot` was
+`0x28da75e51438e7b11d561b5dd1c7b2908240840ef5a684e9f6fd08ccaa379b8a` in tree `0`,
+and it checks out **independently of the device** —
+`rootHistory(0, 0x28da…)` against `0xeCFCf3b4EC647c4Ca6D49108b311b7a7C9543fea`
+over plain `curl` answers `0x…1`:
+
+```bash
+cast calldata "rootHistory(uint256,bytes32)" 0 0x28da75e5…379b8a
+curl -s -X POST -H 'content-type: application/json' \
+  https://ethereum-sepolia-rpc.publicnode.com --data \
+  '{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":
+    "0xeCFCf3b4EC647c4Ca6D49108b311b7a7C9543fea","data":"0xc718dbda…"},"latest"]}'
+# -> 0x0000…0001
+```
+
+Reproduced immediately afterwards: `sync=3840ms` to block 11 721 804, same
+verdict. And the sync figure is the one #235 predicted — **the whole Sepolia
+history, cold, in 3.9 s on an A14**, against the 220 815 ms the same cold sync
+cost on this handset before the tuning. The same survey on aarch64-darwin (dev
+profile, host) is `sync=9247ms`.
+
+What a funded run would add on top of this is a note of the probe's **own** in
+that tree. Everything else about the public chain — that the engine reaches it,
+rebuilds its accumulator and agrees with the contract about the result — is
+measured above.
+
+```bash
+# the survey, on the host, needing nothing
+cargo test --features engine_seam -- --ignored --nocapture an_unfunded_run
+
+# and on the physical iPad
+LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=… \
+  ws run logos-basecamp --target ios-arm64 --app shell \
+     --bundle railgun_module,capability_module \
+     -- --call 'eth_rpc_module.init_defaults()' \
+        --call 'eth_rpc_module.patch_chain_endpoint(int:11155111, str:https://ethereum-sepolia-rpc.publicnode.com)' \
+        --call 'railgun_module.live_send_probe(str:{})'
+```
+
+`patch_chain_endpoint` is spelled out because `eth_rpc_module`'s configuration
+**persists in the app's data container**: a device pointed at a fork in an earlier
+session stays pointed at it across a reinstall, and the run then dies at `funding`
+with `Connection refused` rather than reading the public chain.
+
 **The real sync is the leg with nothing to fall back on**, and it is measured:
 `the_engine_syncs_the_real_sepolia_tree` (an `#[ignore]`d test needing no funds)
-builds the engine and syncs the whole Sepolia UTXO tree — **31.2 s** on
-aarch64-darwin, dev profile, against a public RPC.
+builds the engine and syncs the whole Sepolia UTXO tree — **8.2 s** on
+aarch64-darwin, dev profile, against a public RPC, where the engine's own
+untuned defaults took **31.3 s** for the same walk (#235).
 
 **And the signature is checked by a node rather than by the library that made
 it.** `sign_1559` can only prove to itself that its output recovers to the right
@@ -1120,16 +1216,20 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   artifact source is an upstream-contributable `with_artifact_loader` hook, not a
   fork. Until then, proving (`prepare_transfer`/`prepare_unshield`/`relayed_send`)
   needs network reachability to that source.
-- **A real `prepare_transfer` has still never run on a device (#213).**
-  `proof_circuit_probe` puts a witness through the engine's own
-  `calculate_witness` and a proof through the engine's own arkworks calls, but
-  the input VALUES are placeholders — building a valid one needs a shielded
-  note, a merkle proof over a tree containing it and an EdDSA signature over
-  the public hash, i.e. a funded Sepolia EOA, a mined `prepare_shield` and a
-  `sync` to the tip. That is chain state no probe can fake, and no agent at
-  this venue can obtain testnet funds. What it would add over the numbers
-  above is the verdict (`verified: true`) and the engine's own orchestration
-  around the two calls, not the milliseconds.
+- **Nothing has been sent on the PUBLIC chain (#213 clause 1).** The whole
+  private send — shield mined, sync, the engine's own `calculate_witness`,
+  Groth16 prove and verify, `rootOnChain` true, and the proved `transact(...)`
+  mined by the RAILGUN contract — runs end to end on the physical iPad Air 4,
+  but against `anvil --fork-url <sepolia>`, and every such run says so with
+  `FORK-NOT-PUBLIC-SEPOLIA`. What the public chain adds is that the ETH and the
+  blocks were not local, and it is **one operator transfer**: ≥ 0.0051 Sepolia
+  ETH to `0x23cc2752F664Bf465A3631253687712b222B1722` (the probe mints its own
+  ERC-20 out of it). No agent at this venue can obtain testnet funds, and the
+  venue's own funded account cannot sign for one — keystore signing is a human
+  `approve(handle, bundle_id, password)` and the vault password is not an
+  agent's to have. Until then an unfunded run **surveys** the public chain
+  instead of stopping: engine, a sync of the real accumulator to the live tip,
+  and `syncedRootOnChain` true — measured on the handset, 3.9 s.
 - **Canonical recovery**: `init_from_seed` is not yet RAILGUN-Community BIP-32.
 - **UserOp status**: `relayed_send_status` returns the `userOpHash` once the
   operation is submitted; polling its receipt (`eth_getUserOperationReceipt`) is
