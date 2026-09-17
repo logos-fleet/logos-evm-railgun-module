@@ -1,4 +1,13 @@
-//! THE PRIVATE SEND THE CHAIN ITSELF WITNESSED — #213's remaining clause.
+//! THE PRIVATE SEND THE CHAIN ITSELF WITNESSED — #213's last clause, CLOSED.
+//!
+//! On 2026-09-17, on the venue's physical iPad Air (4th generation), against
+//! PUBLIC Sepolia (`reth/v2.4.1`, `forked: false`), this probe wrapped,
+//! allowed, **shielded** (mined in block 11 723 148, `status 0x1`, 730 311 gas),
+//! synced the real accumulator, proved through the engine's own
+//! `calculate_witness` on the `wasmi` interpreter, and had the RAILGUN contract
+//! **mine the proved `transact(...)`** in block 11 723 149 (`status 0x1`,
+//! 1 002 375 gas). 53 411 ms end to end. The receipts are on the public chain
+//! and in `docs/specs.md`.
 //!
 //! ## What was still missing after the second #213 cycle
 //!
@@ -14,17 +23,21 @@
 //! This module removes that last substitution. Nothing here is fabricated:
 //!
 //! ```text
-//!   funding   how much ETH and ERC-20 the probe's own EOA holds, read off chain
-//!   wrap      `deposit()` on the chain's wrapped base token, so ETH alone is
-//!             enough to fund a run -- skipped when an ERC-20 is already held
 //!   engine    RailgunBuilder over the DEFAULT syncer (subsquid, then RPC) --
 //!             i.e. the real Sepolia tree, not a syncer we wrote
+//!   sync      the engine syncs to tip, beside every other shield anyone ever
+//!             made on this chain
+//!   balance   what that tree already holds for this probe -- the input to the
+//!             funding decision, which is why the free half goes FIRST
+//!   funding   how much ETH and ERC-20 the probe's own EOA holds, read off chain
+//!   wrap      `deposit()` on the chain's wrapped base token, so ETH alone is
+//!             enough to fund a run -- skipped when an ERC-20 is already held,
+//!             and whenever a note is being reused
 //!   approve   ERC-20 approve(RailgunSmartWallet, amount), SIGNED AND BROADCAST
 //!   shield    the ENGINE's own ShieldBuilder calldata, SIGNED AND BROADCAST,
 //!             waited on until a block carries it
-//!   sync      the engine syncs to tip and finds ITS OWN note in the contract's
-//!             tree, beside every other shield anyone ever made on this chain
-//!   balance   a shielded balance that a transaction put there
+//!   resync    the blocks since, the shield's own among them
+//!   note      a shielded balance that a transaction put there
 //!   transfer  TransactionBuilder -> circuit inputs -> calculate_witness ->
 //!             Groth16Prover::prove and verify, over the CONTRACT's merkle root
 //!   root      RailgunSmartWallet.rootHistory(tree, root) -- expected TRUE here,
@@ -68,7 +81,17 @@
 //!
 //! Until the ETH lands every run stops at the `funding` leg and reports the ask,
 //! which is a complete handoff rather than a failure: the address is fixed, so
-//! the funding is a one-time step and every later run is unattended.
+//! the funding is a one-time step and every later run is unattended. It landed:
+//! the runs above are unattended runs off one operator transfer.
+//!
+//! AND THE SECOND RUN COSTS LESS THAN THE FIRST, because a mined shield does not
+//! come back. Where the tree already holds one of this probe's notes there is
+//! nothing to wrap, allow or shield: [`plan`] answers [`Plan::Spend`], the ask
+//! shrinks to [`price_spend`] — what the proved `transact(...)` alone reserves —
+//! and the run goes straight from the sync to the proof. That is what makes an
+//! operator's single transfer survive a run that dies past its shield, which is
+//! a real failure mode: #243 reproduced one, on a fork, with the shield mined
+//! and the broadcast refused for funds.
 //!
 //! HOW MUCH is [`price_run`], read off the chain, rather than a constant. What
 //! decides a run is not what its four transactions spend but what EIP-1559 makes
@@ -240,6 +263,42 @@ pub fn price_run(fee_wei_per_gas: u128, wrap: u128) -> u128 {
         .max(MIN_GAS_WEI.saturating_add(wrap))
 }
 
+/// WHAT THE PROBE'S EOA MUST HOLD WHEN THE TREE ALREADY HOLDS ITS NOTE: the
+/// proved `transact(...)`'s reservation, and nothing before it.
+///
+/// A shield that has been mined has already bought the wrap, the approve and
+/// the shield itself. If the run that mined it then failed -- for funds, for
+/// the artifact host, for an app the platform backgrounded -- the note is still
+/// in the contract's tree and is still this probe's to spend. Asking the
+/// operator for a whole second run would be asking twice for three legs that
+/// are already paid for, and would leave the first note stranded for good.
+///
+/// Same drift allowance as [`price_run`], for the same reason: the fee moves
+/// between the moment the ask is printed and the moment it is funded.
+pub fn price_spend(fee_wei_per_gas: u128) -> u128 {
+    reservation(fee_wei_per_gas.saturating_mul(FEE_DRIFT_MULTIPLE), GAS_TRANSACT)
+}
+
+/// WHY AN ASK IS THE NUMBER IT IS, said in the ask itself: one nobody can check
+/// is one nobody can see has gone stale, and the fee it was priced at is the
+/// thing that moves -- see [`price_run`]. `covers` names the gas the number is
+/// for; a node that would not quote a price leaves the ask at its floor.
+fn priced_at(fee_wei_per_gas: Option<u128>, covers: &str) -> String {
+    match fee_wei_per_gas {
+        Some(fee) => format!(
+            " (priced at the chain's own {fee} wei/gas for {covers}, with room for the fee to \
+             move)"
+        ),
+        None => " (this node would not quote a gas price, so this is the floor)".to_string(),
+    }
+}
+
+/// THE SMALLEST NOTE WORTH SENDING. The transfer is half of what the engine
+/// reports, so a note of one unit splits into a transfer of nothing and is not
+/// the `01x02` operation the rest of this issue measured. Two is the floor the
+/// arithmetic imposes, not a policy.
+pub const MIN_TRANSFERABLE: u128 = 2;
+
 /// CAN THIS PURSE STILL PAY FOR THE `transact` AFTER THE SHIELD?
 ///
 /// Asked immediately before the shield is broadcast, which is the last moment at
@@ -316,6 +375,11 @@ pub struct Params {
     /// [`DEFAULT_SHIELD`] for an ERC-20 the EOA already holds and
     /// [`DEFAULT_WRAP_SHIELD`] for the 18-decimal wrapped base token, since one
     /// number cannot mean the same thing in both.
+    ///
+    /// Has NO effect on a run that reuses a note ([`Plan::Spend`]): there is
+    /// nothing to shield. Deliberate -- the alternative is a caller who passes
+    /// it after a failure paying for a second shield because of a number they
+    /// meant as a default.
     pub shield: Option<u128>,
     /// `None` = half of whatever the engine reports as shielded, which keeps the
     /// operation at one nullifier and two commitments (`01x02`) whatever the
@@ -403,6 +467,17 @@ pub struct Run {
     pub synced_root_on_chain: Option<bool>,
     /// The shielded balance AFTER a real sync of the real tree.
     pub balance: Option<u128>,
+    /// THIS RUN SHIELDED NOTHING: the RAILGUN tree already held a note of this
+    /// probe's, put there by an earlier run, and this one spent that instead.
+    ///
+    /// A mined shield is the expensive half of #213 clause 1 -- 731 335 gas and
+    /// a wait for a block -- and it survives the run that made it. So a run
+    /// that stopped after its shield (out of reservation at the broadcast, out
+    /// of reach of the artifact host, backgrounded by a phone) leaves something
+    /// the next run must SPEND rather than duplicate. `shieldTx` is `None` on
+    /// such a run, and the ask that funds it is the transact's alone
+    /// ([`price_spend`]).
+    pub reused_note: bool,
     pub transferred: Option<u128>,
     pub circuit: Option<String>,
     pub calldata_bytes: Option<usize>,
@@ -502,13 +577,17 @@ pub struct Purse {
     pub fee_wei_per_gas: Option<u128>,
 }
 
-/// What the probe will shield. `wrap` is the wei of the EOA's own ETH to turn
-/// into `token` first.
+/// What the probe will send, and where the note it sends comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Plan {
-    pub token: Address,
-    pub shield: u128,
-    pub wrap: Option<u128>,
+pub enum Plan {
+    /// SPEND WHAT IS ALREADY THERE. The RAILGUN tree holds a note of this
+    /// probe's, so there is nothing to mint, allow or shield: the run goes
+    /// straight from the sync to the proof.
+    Spend { token: Address, units: u128 },
+    /// Nothing spendable in the tree, so the run has to put a note there: it
+    /// shields `units` of `token`, minting `wrap` wei of them out of the EOA's
+    /// own ETH first where the balance is short.
+    Shield { token: Address, units: u128, wrap: Option<u128> },
 }
 
 /// THE OPERATOR ASK, REDUCED TO ONE ASSET. Three #213 cycles stopped on funding,
@@ -520,8 +599,13 @@ pub struct Plan {
 /// any other ERC-20. So ETH alone is now enough, and an ERC-20 the EOA already
 /// holds is still preferred when it is there.
 ///
+/// `shielded` is what the RAILGUN tree already holds for this probe, in the
+/// caller's own order of preference — see [`Plan::Spend`], which is the branch
+/// that makes a funded run survive a failure past its shield.
+///
 /// Pure, and ordered so the answer is never surprising:
 ///
+/// 0. a note already in the tree -> spend it; the ask is the transact alone;
 /// 1. not enough ETH for the whole run -> ask, whatever else is held (see
 ///    `gas_only` below: the last leg's reservation is due whatever is shielded);
 /// 2. enough of the preferred ERC-20 -> shield that, wrap nothing;
@@ -529,7 +613,44 @@ pub struct Plan {
 /// 4. enough of the wrapped base token already -> shield that, wrap nothing;
 /// 5. ETH to cover gas AND the shortfall -> wrap the shortfall;
 /// 6. otherwise -> ask, in ETH.
-pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
+pub fn plan(purse: &Purse, asked: Option<u128>, shielded: &[Holding]) -> Result<Plan, String> {
+    // ── WHAT THE TREE ALREADY HOLDS, WHICH CHANGES THE QUESTION ──────────
+    //
+    // A shield that has been MINED is the expensive half of #213 clause 1, and
+    // it does not come back: it is a leaf in the contract's accumulator, worth
+    // exactly the gas to move it. A run that mined one and then stopped -- out
+    // of reservation at the broadcast (#243's own reproduction), unable to
+    // reach the artifact host, backgrounded by a phone mid-sync -- left that
+    // leaf behind. Shielding again would spend 731 335 gas to create a second
+    // one and abandon the first.
+    //
+    // So the tree is asked BEFORE the purse: with a note already there the run
+    // has only the proved `transact(...)` left to pay for, and an ask priced
+    // for a whole run would refuse a purse that can afford the rescue.
+    if let Some(note) = shielded.iter().find(|h| h.units >= MIN_TRANSFERABLE) {
+        let ask = match purse.fee_wei_per_gas {
+            Some(fee) => price_spend(fee),
+            None => MIN_GAS_WEI,
+        };
+        if purse.wei < ask {
+            return Err(format!(
+                "fund {} on Sepolia with at least {ask} wei of ETH{}: it holds {} wei, and the \
+                 RAILGUN tree ALREADY holds {} units of {} shielded to this probe. An earlier run \
+                 mined that shield, so this one needs only the gas to SPEND the note -- not to \
+                 wrap, allow and shield a second one. Nothing already spent is lost.",
+                purse.eoa,
+                priced_at(
+                    purse.fee_wei_per_gas,
+                    &format!("the {GAS_TRANSACT} gas of the proved transact(...)"),
+                ),
+                purse.wei,
+                note.units,
+                note.token,
+            ));
+        }
+        return Ok(Plan::Spend { token: note.token, units: note.units });
+    }
+
     // What a run would shield out of each source. One number cannot serve both:
     // the preferred ERC-20 is a 6-decimal stablecoin and the wrapped base token
     // is 18-decimal ETH.
@@ -579,18 +700,13 @@ pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
              rust-lib/src/live_send.rs), so this is a one-time step -- every run after it is \
              unattended.",
             purse.eoa,
-            // WHY THAT NUMBER. An ask nobody can check is an ask nobody can see
-            // has gone stale, and the fee it was priced at is the thing that
-            // moves -- see `price_run`.
-            match purse.fee_wei_per_gas {
-                Some(fee) => format!(
-                    " (priced at the chain's own {fee} wei/gas for {} gas of shield and \
-                     transact, with room for the fee to move)",
+            priced_at(
+                purse.fee_wei_per_gas,
+                &format!(
+                    "{} gas of shield and transact",
                     GAS_WRAP + GAS_APPROVE + GAS_SHIELD + GAS_TRANSACT
                 ),
-                None => " (this node would not quote a gas price, so this is the floor)"
-                    .to_string(),
-            },
+            ),
             purse.wei
         )
     };
@@ -599,16 +715,20 @@ pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
         return Err(ask());
     }
     if purse.erc20.units >= want_erc20 {
-        return Ok(Plan { token: purse.erc20.token, shield: want_erc20, wrap: None });
+        return Ok(Plan::Shield { token: purse.erc20.token, units: want_erc20, wrap: None });
     }
     let Some(wrapped) = purse.wrapped else {
         return Err(ask());
     };
     if wrapped.units >= want_wrapped {
-        return Ok(Plan { token: wrapped.token, shield: want_wrapped, wrap: None });
+        return Ok(Plan::Shield { token: wrapped.token, units: want_wrapped, wrap: None });
     }
     if purse.wei >= full_ask {
-        return Ok(Plan { token: wrapped.token, shield: want_wrapped, wrap: Some(shortfall) });
+        return Ok(Plan::Shield {
+            token: wrapped.token,
+            units: want_wrapped,
+            wrap: Some(shortfall),
+        });
     }
     Err(ask())
 }
@@ -999,9 +1119,16 @@ async fn sync_windows(
 /// far came from a local fork, whose tip does not move and whose node is on the
 /// same desk.
 ///
-/// IT IS NOT A SEND AND MUST NOT READ LIKE ONE. The `funding` leg is already
-/// red when this is reached, so [`Run::ok`] stays false, [`summary`] says
-/// `DID NOT` and prints `SURVEY-ONLY-UNFUNDED`, and nothing here signs anything.
+/// IT IS NOT A SEND AND MUST NOT READ LIKE ONE. Nothing here signs anything;
+/// when the `funding` leg that follows goes red, [`Run::ok`] stays false and
+/// [`summary`] says `DID NOT` and prints `SURVEY-ONLY-UNFUNDED`.
+///
+/// AND IT IS THE HEAD OF EVERY RUN, not just an unfunded one's consolation. The
+/// funding decision needs to know whether the tree ALREADY holds one of this
+/// probe's notes ([`Plan::Spend`]), and only a sync can say — so the run syncs
+/// before it prices itself, which it could not have afforded to do before #235
+/// cut that leg from 221 s to seconds. What comes back is the synced engine
+/// itself, so a send reuses it instead of building and walking a second one.
 async fn survey<B: RpcBackend>(
     out: &mut Run,
     chain: &ChainConfig,
@@ -1009,12 +1136,13 @@ async fn survey<B: RpcBackend>(
     watch: &RootWatch<B>,
     signer: Arc<dyn RailgunSigner>,
     from: RailgunAddress,
-) {
+    candidates: &[Address],
+) -> Option<Surveyed> {
     entering("engine");
     let t = Instant::now();
     let db = Arc::new(MemoryDatabase::new());
     let built = build_engine(chain, eip1193.clone(), db.clone(), signer).await;
-    let Some(mut provider) = out.record_leg("engine", t, built) else { return };
+    let mut provider = out.record_leg("engine", t, built)?;
 
     entering("sync");
     let t = Instant::now();
@@ -1025,23 +1153,43 @@ async fn survey<B: RpcBackend>(
         out.sync_from_block = Some(plan.start_block);
         out.sync_to_block = Some(plan.target_block);
     }
-    if out.record_leg("sync", t, synced).is_none() {
-        return;
-    }
+    out.record_leg("sync", t, synced)?;
 
     let t = Instant::now();
     let checked = record_root_check(out, watch);
-    if out.record_leg("synced-root", t, checked).is_none() {
-        return;
-    }
+    out.record_leg("synced-root", t, checked)?;
 
     entering("balance");
     let t = Instant::now();
+    let held = provider.balance(from).await;
     // Every asset, not one: a survey has chosen no asset to shield, and a
     // balance the probe did not expect is worth seeing rather than filtering out.
-    let balance: u128 = provider.balance(from).await.iter().map(|b| b.amount).sum();
-    out.balance = Some(balance);
+    out.balance = Some(held.iter().map(|b| b.amount).sum());
+    // And the same balances per candidate token, in the caller's order of
+    // preference -- which is what [`plan`] reads to decide whether this run has
+    // anything left to shield.
+    let shielded = candidates
+        .iter()
+        .map(|&token| {
+            let id = AssetId::erc20(token);
+            Holding {
+                token,
+                units: held.iter().filter(|b| b.asset == id).map(|b| b.amount).sum(),
+            }
+        })
+        .collect();
     out.legs.push(Leg::timed("balance", Some(t.elapsed().as_millis())));
+    Some(Surveyed { provider, db, shielded })
+}
+
+/// The engine a [`survey`] built and walked, and what it found. Carried rather
+/// than dropped so a send does not build a second engine and re-walk the same
+/// accumulator behind it.
+struct Surveyed {
+    provider: RailgunProvider,
+    db: Arc<MemoryDatabase>,
+    /// What the tree holds of each candidate token, in the caller's order.
+    shielded: Vec<Holding>,
 }
 
 // ── the run ─────────────────────────────────────────────────────────────────
@@ -1117,7 +1265,26 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     out.to = Some(to.to_string());
     out.legs.push(Leg::timed("keys", None));
 
-    // ── can this account pay for what follows? ─────────────────────────────
+    // ── THE FREE HALF, WHICH EVERY RUN MAKES FIRST ─────────────────────────
+    //
+    // Engine, sync, the root the engine checks and discards, and the balance --
+    // none of which costs anything, and one of which decides the question the
+    // `funding` leg is about: a note this probe ALREADY owns is a run with
+    // three legs fewer and a much smaller ask (see [`Plan::Spend`]). Before
+    // #235 this could not have gone first -- the sync was 221 s on a handset.
+    let candidates: Vec<Address> = [Some(preferred), mintable].into_iter().flatten().collect();
+    let surveyed = survey(
+        &mut out,
+        &chain,
+        eip1193.clone(),
+        watch.as_ref(),
+        engine_signer,
+        from.clone(),
+        &candidates,
+    )
+    .await;
+
+    // ── can this account pay for what is LEFT to do? ───────────────────────
     entering("funding");
     let t = Instant::now();
     let held = |token: Address| {
@@ -1149,22 +1316,29 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     };
     out.eth_wei = Some(purse.wei);
     out.fee_wei_per_gas = purse.fee_wei_per_gas;
-    let chosen = match plan(&purse, p.shield) {
+    let already = surveyed.as_ref().map_or(&[][..], |s| s.shielded.as_slice());
+    let chosen = match plan(&purse, p.shield, already) {
         Ok(chosen) => chosen,
         Err(ask) => {
             out.token_units = Some(purse.erc20.units);
             out.needs_funding = Some(ask.clone());
             out.legs.push(Leg::failed("funding", Some(t.elapsed().as_millis()), ask));
-            // NOT THE END OF THE RUN. Nothing past here can be signed, but the
-            // chain reads cost nothing and the sync is the leg that dominates a
-            // private send -- see `survey`.
-            survey(&mut out, &chain, eip1193.clone(), watch.as_ref(), engine_signer, from.clone())
-                .await;
+            // The survey above already measured everything money is not needed
+            // for, so there is nothing left to do but hand off.
             return out.finished(started);
         }
     };
-    let token = chosen.token;
-    let shield_units = chosen.shield;
+    let (token, shield_units, wrap_wei) = match chosen {
+        Plan::Shield { token, units, wrap } => (token, units, wrap),
+        Plan::Spend { token, units } => {
+            // A NOTE AN EARLIER RUN MINED. Nothing to wrap, allow or shield:
+            // the three legs it would take are already paid for, and shielding
+            // again would abandon this leaf in the contract's tree.
+            out.reused_note = true;
+            out.balance = Some(units);
+            (token, units, None)
+        }
+    };
     let asset = AssetId::erc20(token);
     out.asset = Some(asset.to_string());
     out.token_units = Some(if token == purse.erc20.token {
@@ -1174,169 +1348,170 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     });
     out.legs.push(Leg::timed("funding", Some(t.elapsed().as_millis())));
 
-    // ── mint what is missing, out of the probe's own ETH ─────────────────
-    if let Some(amount) = chosen.wrap {
-        entering("wrap");
+    // AN ASK IS PRINTED EITHER WAY, BUT A BROKEN SURVEY IS NOT A SEND. The
+    // engine or the sync went red above, so the tree this run would prove
+    // against is not the chain's -- and every leg after this one would be
+    // measuring that instead of a private send.
+    let Some(Surveyed { mut provider, db, .. }) = surveyed else {
+        return out.finished(started);
+    };
+
+    // ── EVERYTHING A NOTE ALREADY IN THE TREE MAKES UNNECESSARY ────────────
+    //
+    // Wrap, allow, shield, and the walk to the block the shield landed in. A
+    // run that mined a shield and then failed has paid for all four; doing them
+    // again would cost another 731 335 gas and abandon the leaf it left.
+    if !out.reused_note {
+        // ── mint what is missing, out of the probe's own ETH ─────────────────
+        if let Some(amount) = wrap_wei {
+            entering("wrap");
+            let t = Instant::now();
+            out.wrapped_wei = Some(amount);
+            match wrap_native(&eoa, token, amount, Duration::from_millis(p.confirm_ms)).await {
+                Ok((tx, _)) => {
+                    out.wrap_tx = Some(tx);
+                    out.legs.push(Leg::timed("wrap", Some(t.elapsed().as_millis())));
+                }
+                Err(e) => {
+                    out.legs.push(Leg::failed("wrap", Some(t.elapsed().as_millis()), e));
+                    return out.finished(started);
+                }
+            }
+        }
+
+        // ── approve, if the smart wallet may not already move the tokens ───────
+        entering("approve");
         let t = Instant::now();
-        out.wrapped_wei = Some(amount);
-        match wrap_native(&eoa, token, amount, Duration::from_millis(p.confirm_ms)).await {
-            Ok((tx, _)) => {
-                out.wrap_tx = Some(tx);
-                out.legs.push(Leg::timed("wrap", Some(t.elapsed().as_millis())));
+        let approved: Result<Option<String>, String> = async {
+            let current: U256 = eip1193
+                .sol_call(token, allowanceCall { owner: eoa.address, spender: smart_wallet })
+                .await
+                .map_err(|e| format!("allowance: {e}"))?;
+            if current >= U256::from(shield_units) {
+                return Ok(None);
+            }
+            let data: Bytes = approveCall { spender: smart_wallet, value: U256::from(shield_units) }
+                .abi_encode()
+                .into();
+            let gas = eoa.gas_limit(token, U256::ZERO, &data)?;
+            eoa.send(token, U256::ZERO, data, gas).map(Some)
+        }
+        .await;
+        let allowance_set = match approved {
+            Ok(Some(tx)) => {
+                out.approve_tx = Some(tx.clone());
+                eoa.wait(&tx, Duration::from_millis(p.confirm_ms)).await.map(|_| ())
+            }
+            // An allowance that is already enough is not a leg that did nothing: it
+            // is the second run of the day, and saying so keeps the timings readable.
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = allowance_set {
+            out.legs.push(Leg::failed("approve", Some(t.elapsed().as_millis()), e));
+            return out.finished(started);
+        }
+        out.legs.push(Leg::timed("approve", Some(t.elapsed().as_millis())));
+
+        // ── the shield: the ENGINE's calldata, this probe's signature ──────────
+        //
+        // FIRST, THE LAST FREE QUESTION. Everything up to here is recoverable: the
+        // wrap left WETH the next run reuses and the approve left an allowance it
+        // reuses. A shield is not -- it puts a note in the contract's tree, and a
+        // note is worth the gas to move it, which is the gas this leg is about to
+        // spend. So the run re-prices against the fee as it is NOW rather than as
+        // it was at the `funding` leg, minutes and several blocks ago.
+        entering("shield");
+        let t = Instant::now();
+        let gate = shield_gate(&eoa);
+        out.fee_wei_per_gas = gate.fee_wei_per_gas.or(out.fee_wei_per_gas);
+        out.eth_wei = gate.wei.or(out.eth_wei);
+        if let Some(e) = gate.refusal {
+            out.needs_funding = Some(e.clone());
+            out.legs.push(Leg::failed("shield", Some(t.elapsed().as_millis()), e));
+            return out.finished(started);
+        }
+        let shield = provider
+            .shield()
+            .shield(from.clone(), asset, shield_units)
+            .build(&mut rand::rng())
+            .map_err(|e| format!("build shield: {e}"))
+            .and_then(|txs| {
+                txs.into_iter().next().ok_or_else(|| "the engine built no shield transaction".to_string())
+            })
+            .and_then(|tx| {
+                let gas = eoa.gas_limit(tx.to, tx.value, &tx.data)?;
+                eoa.send(tx.to, tx.value, tx.data, gas)
+            });
+        let shield_tx = match shield {
+            Ok(tx) => tx,
+            Err(e) => {
+                out.legs.push(Leg::failed("shield", Some(t.elapsed().as_millis()), e));
+                return out.finished(started);
+            }
+        };
+        out.shield_tx = Some(shield_tx.clone());
+        match eoa.wait(&shield_tx, Duration::from_millis(p.confirm_ms)).await {
+            Ok(block) => {
+                out.shield_block = Some(block);
+                out.legs.push(Leg::timed("shield", Some(t.elapsed().as_millis())));
             }
             Err(e) => {
-                out.legs.push(Leg::failed("wrap", Some(t.elapsed().as_millis()), e));
+                out.legs.push(Leg::failed("shield", Some(t.elapsed().as_millis()), e));
                 return out.finished(started);
             }
         }
-    }
 
-    // ── the engine, over the REAL syncer and the real tree ─────────────────
-    entering("engine");
-    let t = Instant::now();
-    let db = Arc::new(MemoryDatabase::new());
-    let built = build_engine(&chain, eip1193.clone(), db.clone(), engine_signer).await;
-    let Some(mut provider) = out.record_leg("engine", t, built) else {
-        return out.finished(started);
-    };
+        // ── the tail of the shield: walk to it, and see the note it left ───────
+        //
+        // The accumulator was already walked before the `funding` leg, so this is
+        // the blocks since -- the shield's own among them. The same engine and the
+        // same database, so it resumes rather than starting again.
+        entering("resync");
+        let t = Instant::now();
+        // The account whose record says how far the sync has got -- this probe's own
+        // `0zk`, the one `sync::synced_block` takes the minimum against.
+        let zk_address = from.to_string();
+        let (_, resynced) =
+            sync_windows(&mut provider, &eip1193, &chain, db.as_ref(), &zk_address).await;
+        if out.record_leg("resync", t, resynced).is_none() {
+            return out.finished(started);
+        }
 
-    // ── approve, if the smart wallet may not already move the tokens ───────
-    entering("approve");
-    let t = Instant::now();
-    let approved: Result<Option<String>, String> = async {
-        let current: U256 = eip1193
-            .sol_call(token, allowanceCall { owner: eoa.address, spender: smart_wallet })
+        // ── a shielded balance a transaction put there ─────────────────────────
+        entering("note");
+        let t = Instant::now();
+        let balance: u128 = provider
+            .balance(from.clone())
             .await
-            .map_err(|e| format!("allowance: {e}"))?;
-        if current >= U256::from(shield_units) {
-            return Ok(None);
-        }
-        let data: Bytes = approveCall { spender: smart_wallet, value: U256::from(shield_units) }
-            .abi_encode()
-            .into();
-        let gas = eoa.gas_limit(token, U256::ZERO, &data)?;
-        eoa.send(token, U256::ZERO, data, gas).map(Some)
-    }
-    .await;
-    let allowance_set = match approved {
-        Ok(Some(tx)) => {
-            out.approve_tx = Some(tx.clone());
-            eoa.wait(&tx, Duration::from_millis(p.confirm_ms)).await.map(|_| ())
-        }
-        // An allowance that is already enough is not a leg that did nothing: it
-        // is the second run of the day, and saying so keeps the timings readable.
-        Ok(None) => Ok(()),
-        Err(e) => Err(e),
-    };
-    if let Err(e) = allowance_set {
-        out.legs.push(Leg::failed("approve", Some(t.elapsed().as_millis()), e));
-        return out.finished(started);
-    }
-    out.legs.push(Leg::timed("approve", Some(t.elapsed().as_millis())));
-
-    // ── the shield: the ENGINE's calldata, this probe's signature ──────────
-    //
-    // FIRST, THE LAST FREE QUESTION. Everything up to here is recoverable: the
-    // wrap left WETH the next run reuses and the approve left an allowance it
-    // reuses. A shield is not -- it puts a note in the contract's tree, and a
-    // note is worth the gas to move it, which is the gas this leg is about to
-    // spend. So the run re-prices against the fee as it is NOW rather than as
-    // it was at the `funding` leg, minutes and several blocks ago.
-    entering("shield");
-    let t = Instant::now();
-    let gate = shield_gate(&eoa);
-    out.fee_wei_per_gas = gate.fee_wei_per_gas.or(out.fee_wei_per_gas);
-    out.eth_wei = gate.wei.or(out.eth_wei);
-    if let Some(e) = gate.refusal {
-        out.needs_funding = Some(e.clone());
-        out.legs.push(Leg::failed("shield", Some(t.elapsed().as_millis()), e));
-        return out.finished(started);
-    }
-    let shield = provider
-        .shield()
-        .shield(from.clone(), asset, shield_units)
-        .build(&mut rand::rng())
-        .map_err(|e| format!("build shield: {e}"))
-        .and_then(|txs| {
-            txs.into_iter().next().ok_or_else(|| "the engine built no shield transaction".to_string())
-        })
-        .and_then(|tx| {
-            let gas = eoa.gas_limit(tx.to, tx.value, &tx.data)?;
-            eoa.send(tx.to, tx.value, tx.data, gas)
-        });
-    let shield_tx = match shield {
-        Ok(tx) => tx,
-        Err(e) => {
-            out.legs.push(Leg::failed("shield", Some(t.elapsed().as_millis()), e));
+            .iter()
+            .filter(|b| b.asset == asset)
+            .map(|b| b.amount)
+            .sum();
+        let ms = Some(t.elapsed().as_millis());
+        out.balance = Some(balance);
+        if balance == 0 {
+            out.legs.push(Leg::failed(
+                "note",
+                ms,
+                format!(
+                    "the shield was mined in block {:?} and the engine still sees 0 of {asset} \
+                     shielded -- it synced past its own note or could not decrypt it",
+                    out.shield_block
+                ),
+            ));
             return out.finished(started);
         }
-    };
-    out.shield_tx = Some(shield_tx.clone());
-    match eoa.wait(&shield_tx, Duration::from_millis(p.confirm_ms)).await {
-        Ok(block) => {
-            out.shield_block = Some(block);
-            out.legs.push(Leg::timed("shield", Some(t.elapsed().as_millis())));
-        }
-        Err(e) => {
-            out.legs.push(Leg::failed("shield", Some(t.elapsed().as_millis()), e));
-            return out.finished(started);
-        }
+        out.legs.push(Leg::timed("note", ms));
     }
-
-    // ── the sync: the whole of Sepolia's tree, our note among it ───────────
-    entering("sync");
-    let t = Instant::now();
-    // The account whose record says how far the sync has got -- this probe's own
-    // `0zk`, the one `sync::synced_block` takes the minimum against.
-    let zk_address = from.to_string();
-    let (plan, synced) =
-        sync_windows(&mut provider, &eip1193, &chain, db.as_ref(), &zk_address).await;
-    if let Some(plan) = &plan {
-        out.sync_from_block = Some(plan.start_block);
-        out.sync_to_block = Some(plan.target_block);
-    }
-    if out.record_leg("sync", t, synced).is_none() {
-        return out.finished(started);
-    }
-
-    // And the verdict the engine asked for and threw away -- read BEFORE the
-    // `root-on-chain` leg below asks its own question through the same watch.
-    let t = Instant::now();
-    let checked = record_root_check(&mut out, watch.as_ref());
-    if out.record_leg("synced-root", t, checked).is_none() {
-        return out.finished(started);
-    }
-
-    // ── a shielded balance a transaction put there ─────────────────────────
-    entering("balance");
-    let t = Instant::now();
-    let balance: u128 = provider
-        .balance(from.clone())
-        .await
-        .iter()
-        .filter(|b| b.asset == asset)
-        .map(|b| b.amount)
-        .sum();
-    let ms = Some(t.elapsed().as_millis());
-    out.balance = Some(balance);
-    if balance == 0 {
-        out.legs.push(Leg::failed(
-            "balance",
-            ms,
-            format!(
-                "the shield was mined in block {:?} and the engine still sees 0 of {asset} \
-                 shielded -- it synced past its own note or could not decrypt it",
-                out.shield_block
-            ),
-        ));
-        return out.finished(started);
-    }
-    out.legs.push(Leg::timed("balance", ms));
 
     // ── the private send itself ────────────────────────────────────────────
     // RAILGUN takes a shield fee, so the note is worth slightly less than what
     // was shielded; half of what the ENGINE reports keeps a change note and so
     // keeps the operation on the 01x02 circuit the other two probes measured.
+    // Whatever the run is sending out of: the note the `funding` leg found in
+    // the tree, or the one the `shield` leg above put there.
+    let balance = out.balance.unwrap_or_default();
     let value = p.transfer.unwrap_or(balance / 2).min(balance);
     out.transferred = Some(value);
     entering("transfer");
@@ -1463,11 +1638,11 @@ pub fn report(r: &Run) {
 pub fn summary(r: &Run) -> String {
     let leg = |n: &str| r.leg(n).and_then(|l| l.ms);
     format!(
-        "railgun_module: live-send probe: {} (chain={} node={:?}{}{} witnessBackend={:?} eoa={:?} \
-         circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} syncedRootOnChain={:?} \
-         asset={:?} wrappedWei={:?} feeWeiPerGas={:?} \
-         shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
-         approve={:?}ms shield={:?}ms sync={:?}ms/{:?}blocks balance={:?}ms transfer={:?}ms \
+        "railgun_module: live-send probe: {} (chain={} node={:?}{}{}{} witnessBackend={:?} \
+         eoa={:?} circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} \
+         syncedRootOnChain={:?} asset={:?} wrappedWei={:?} feeWeiPerGas={:?} shieldTx={:?} \
+         transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms approve={:?}ms \
+         shield={:?}ms sync={:?}ms/{:?}blocks resync={:?}ms balance={:?}ms transfer={:?}ms \
          broadcast={:?}ms total={}ms)",
         if r.ok() { "SENT" } else { "DID NOT" },
         r.chain_id,
@@ -1476,6 +1651,11 @@ pub fn summary(r: &Run) -> String {
         // A run that could not pay measured the chain and sent nothing. Said in
         // the line itself, because the timings below it look like a send's.
         if r.needs_funding.is_some() { " SURVEY-ONLY-UNFUNDED" } else { "" },
+        // And a run that shielded NOTHING because the tree already held its
+        // note: `shieldTx` is None and `shield` has no milliseconds, which on
+        // its own reads like a leg that was skipped rather than one that was
+        // already paid for.
+        if r.reused_note { " REUSED-A-MINED-SHIELD" } else { "" },
         r.witness_backend(),
         r.eoa,
         r.circuit,
@@ -1496,6 +1676,9 @@ pub fn summary(r: &Run) -> String {
         leg("shield"),
         leg("sync"),
         r.sync_from_block.zip(r.sync_to_block).map(|(from, to)| to.saturating_sub(from)),
+        leg("resync"),
+        // The survey's own balance leg, which every run that got past the sync
+        // has -- a `note` leg only ever exists behind one.
         leg("balance"),
         leg("transfer"),
         leg("broadcast"),
@@ -1833,26 +2016,40 @@ mod tests {
         }
     }
 
+    /// The shield half of a plan, for the tests that are about the funding
+    /// decision rather than about a note already in the tree.
+    fn shielding(p: Plan) -> (Address, u128, Option<u128>) {
+        match p {
+            Plan::Shield { token, units, wrap } => (token, units, wrap),
+            Plan::Spend { token, units } => {
+                panic!("expected a shield plan, got a spend of {units} units of {token}")
+            }
+        }
+    }
+
     // #213's THIRD BLOCKER, REMOVED. For three cycles the run stopped because
     // the EOA held no ERC-20, and an arbitrary test token is the half of the ask
     // an operator cannot satisfy from a faucet. It never had to be asked for:
     // the chain config names a token the probe can MINT out of its own ETH.
     #[test]
     fn eth_alone_is_enough_because_the_probe_mints_its_own_erc20() {
-        let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(0)), None)
+        let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(0)), None, &[])
             .expect("a well-funded-in-ETH account is not a funding ask any more");
-        assert_eq!(chosen.token, ChainConfig::sepolia().wrapped_base_token);
-        assert_eq!(chosen.shield, DEFAULT_WRAP_SHIELD);
-        assert_eq!(chosen.wrap, Some(DEFAULT_WRAP_SHIELD), "it has to mint the whole amount");
+        let (token, units, wrap) = shielding(chosen);
+        assert_eq!(token, ChainConfig::sepolia().wrapped_base_token);
+        assert_eq!(units, DEFAULT_WRAP_SHIELD);
+        assert_eq!(wrap, Some(DEFAULT_WRAP_SHIELD), "it has to mint the whole amount");
     }
 
     // And an ERC-20 that is already there is still preferred, so the 20 USDC the
     // venue funded once are not stranded by this.
     #[test]
     fn an_erc20_the_eoa_already_holds_beats_wrapping() {
-        let chosen = plan(&purse(MIN_GAS_WEI * 4, DEFAULT_SHIELD, Some(0)), None).expect("funded");
-        assert_eq!(chosen.token, SEPOLIA_USDC.parse::<Address>().unwrap());
-        assert_eq!(chosen.wrap, None, "it wrapped ETH it did not need to");
+        let chosen =
+            plan(&purse(MIN_GAS_WEI * 4, DEFAULT_SHIELD, Some(0)), None, &[]).expect("funded");
+        let (token, _, wrap) = shielding(chosen);
+        assert_eq!(token, SEPOLIA_USDC.parse::<Address>().unwrap());
+        assert_eq!(wrap, None, "it wrapped ETH it did not need to");
     }
 
     // Wrapping only covers the SHORTFALL: a second run on the same EOA leaves
@@ -1860,10 +2057,13 @@ mod tests {
     #[test]
     fn a_partial_wrapped_balance_is_topped_up_not_replaced() {
         let held = DEFAULT_WRAP_SHIELD / 4;
-        let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(held)), None).expect("funded");
-        assert_eq!(chosen.wrap, Some(DEFAULT_WRAP_SHIELD - held));
-        let enough = plan(&purse(MIN_GAS_WEI * 4, 0, Some(DEFAULT_WRAP_SHIELD)), None).unwrap();
-        assert_eq!(enough.wrap, None);
+        let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(held)), None, &[]).expect("funded");
+        let (_, _, wrap) = shielding(chosen);
+        assert_eq!(wrap, Some(DEFAULT_WRAP_SHIELD - held));
+        let enough =
+            plan(&purse(MIN_GAS_WEI * 4, 0, Some(DEFAULT_WRAP_SHIELD)), None, &[]).unwrap();
+        let (_, _, already_wrapped) = shielding(enough);
+        assert_eq!(already_wrapped, None);
     }
 
     // Gas alone, with no room to wrap, is still an ask — and the number in it is
@@ -1871,7 +2071,7 @@ mod tests {
     // one leg later.
     #[test]
     fn gas_with_no_room_to_wrap_is_a_funding_ask() {
-        let err = plan(&purse(MIN_GAS_WEI, 0, Some(0)), None).expect_err("it cannot shield");
+        let err = plan(&purse(MIN_GAS_WEI, 0, Some(0)), None, &[]).expect_err("it cannot shield");
         assert!(err.contains(&(MIN_GAS_WEI + DEFAULT_WRAP_SHIELD).to_string()), "{err}");
     }
 
@@ -1879,7 +2079,8 @@ mod tests {
     // token and nowhere else, so a caller who names a token has to bring it.
     #[test]
     fn a_named_asset_is_never_wrapped() {
-        let err = plan(&purse(MIN_GAS_WEI * 4, 0, None), None).expect_err("it holds none of it");
+        let err =
+            plan(&purse(MIN_GAS_WEI * 4, 0, None), None, &[]).expect_err("it holds none of it");
         assert!(err.contains("named an asset"), "{err}");
         assert!(!err.contains("mints its own"), "{err}");
     }
@@ -1888,9 +2089,126 @@ mod tests {
     // it, so reporting a token balance as if it were progress would mislead.
     #[test]
     fn no_gas_is_an_ask_even_with_the_token_in_hand() {
-        let err = plan(&purse(0, DEFAULT_SHIELD * 100, Some(DEFAULT_WRAP_SHIELD)), None)
+        let err = plan(&purse(0, DEFAULT_SHIELD * 100, Some(DEFAULT_WRAP_SHIELD)), None, &[])
             .expect_err("it cannot pay for a transaction");
         assert!(err.contains(&MIN_GAS_WEI.to_string()), "{err}");
+    }
+
+    // ── A NOTE THE TREE ALREADY HOLDS, which changes the question ─────────
+
+    // THE EXPENSIVE HALF OF CLAUSE 1 IS A MINED SHIELD, AND A RUN CAN LOSE IT.
+    //
+    // #243 stopped the probe STRANDING a note -- it will not shield when what
+    // would be left cannot pay for the proved `transact(...)`. It did nothing
+    // for a note that is already there, and there are several ways to get one:
+    // a run whose `transfer` leg could not reach the artifact host, a phone
+    // that backgrounded the app mid-sync, a `broadcast` that was refused for
+    // funds (which is exactly the failure #243 reproduced, on a fork, WITH the
+    // shield already mined). In every one of them the operator's transfer has
+    // bought a note in the contract's tree.
+    //
+    // Before this, the next run shielded a SECOND note -- another 731 335 gas,
+    // another whole funding ask -- and left the first one unspendable for good.
+    #[test]
+    fn a_note_already_in_the_tree_is_spent_instead_of_shielded_again() {
+        let fee = 1_025_000_000_u128;
+        let weth = ChainConfig::sepolia().wrapped_base_token;
+        // What is left after a run that mined its shield and then stopped: it
+        // wrapped, allowed and shielded, so the ETH is nearly gone and the WETH
+        // with it. Not enough for another whole run, by construction.
+        let left = price_spend(fee);
+        let broke = Purse { fee_wei_per_gas: Some(fee), ..purse(left, 0, Some(0)) };
+        assert!(
+            left < price_run(fee, DEFAULT_WRAP_SHIELD),
+            "this test is meaningless unless the purse is short of a whole run"
+        );
+        plan(&broke, None, &[]).expect_err("with an empty tree this purse cannot start a run");
+
+        // But the tree holds what the last run put there.
+        let note = [Holding { token: weth, units: DEFAULT_WRAP_SHIELD }];
+        assert_eq!(
+            plan(&broke, None, &note).expect("a note in the tree is a run this purse CAN finish"),
+            Plan::Spend { token: weth, units: DEFAULT_WRAP_SHIELD },
+            "it shielded a second note instead of spending the one already in the tree"
+        );
+    }
+
+    // And the ask, when there IS a note, is the transact alone -- the three legs
+    // before it have already been paid for, by the run that mined the shield.
+    // An operator topping up after a failure must not be asked twice for them.
+    #[test]
+    fn the_ask_after_a_mined_shield_is_only_what_the_transact_reserves() {
+        let fee = 1_025_000_000_u128;
+        let weth = ChainConfig::sepolia().wrapped_base_token;
+        let note = [Holding { token: weth, units: DEFAULT_WRAP_SHIELD }];
+        let empty = Purse { fee_wei_per_gas: Some(fee), ..purse(0, 0, Some(0)) };
+        let ask = plan(&empty, None, &note).expect_err("an empty EOA cannot pay for the transact");
+        // Spelled out rather than read back from `price_spend`: the transact's
+        // reservation is `max_fee_per_gas` (twice the quoted fee) over a limit
+        // 30 % above its measured gas, at a fee allowed to double under it.
+        let expected = 2 * fee * 2 * (GAS_TRANSACT * 13 / 10);
+        assert!(ask.contains(&expected.to_string()), "the ask is not the transact's own: {ask}");
+        assert!(
+            expected < price_run(fee, DEFAULT_WRAP_SHIELD),
+            "a rescue that costs more than a fresh run is not a rescue"
+        );
+        assert!(
+            ask.contains("ALREADY holds"),
+            "an operator must be told the money already spent is not lost: {ask}"
+        );
+    }
+
+    // A note too small to split is not a note this probe can send: the transfer
+    // is half of it, and half of one unit is nothing to prove over. Shield.
+    #[test]
+    fn a_note_too_small_to_split_is_shielded_over_rather_than_spent() {
+        let weth = ChainConfig::sepolia().wrapped_base_token;
+        // ONE unit, spelled out: half of it is nothing, so there is no transfer
+        // to prove and no change note to keep the operation on `01x02`. Written
+        // as the number rather than as `MIN_TRANSFERABLE - 1`, which would move
+        // with the constant and assert nothing about where the floor is.
+        let dust = [Holding { token: weth, units: 1 }];
+        let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(0)), None, &dust)
+            .expect("a funded purse is not an ask");
+        let (_, _, wrap) = shielding(chosen);
+        assert_eq!(wrap, Some(DEFAULT_WRAP_SHIELD), "it tried to send a note of one unit");
+    }
+
+    // The caller's order is the preference: the run reads the engine's balance
+    // for the token it would otherwise shield FIRST, so a stale note in some
+    // other asset cannot divert a run that was asked for a named one.
+    #[test]
+    fn the_first_spendable_note_the_caller_offers_is_the_one_taken() {
+        let fee = 1_025_000_000_u128;
+        let weth = ChainConfig::sepolia().wrapped_base_token;
+        let usdc: Address = SEPOLIA_USDC.parse().unwrap();
+        let funded = Purse { fee_wei_per_gas: Some(fee), ..purse(price_run(fee, 0) * 4, 0, Some(0)) };
+        let notes = [
+            Holding { token: usdc, units: 1 },
+            Holding { token: weth, units: DEFAULT_WRAP_SHIELD },
+        ];
+        assert_eq!(
+            plan(&funded, None, &notes).expect("funded"),
+            Plan::Spend { token: weth, units: DEFAULT_WRAP_SHIELD },
+            "it took a note it cannot split over one it can"
+        );
+    }
+
+    // AND THE ONE LINE HAS TO SAY SO. On a reuse run `shieldTx` is null and the
+    // `shield` leg has no milliseconds, which on their own read like a leg that
+    // was skipped rather than one an earlier run already paid for.
+    #[test]
+    fn a_run_that_reused_a_note_says_so_in_the_line_it_is_judged_by() {
+        assert!(
+            !summary(&Run::default()).contains("REUSED"),
+            "a run that shielded for itself must not claim to have reused anything"
+        );
+        let reused = Run { reused_note: true, ..Default::default() };
+        assert!(
+            summary(&reused).contains("REUSED-A-MINED-SHIELD"),
+            "a run that shielded nothing does not say why: {}",
+            summary(&reused)
+        );
     }
 
     // ── WHAT THE ASK IS WORTH, which is not what a constant says ──────────
@@ -2352,6 +2670,66 @@ mod tests {
             "the contract does not know the root this device synced to: {:?}",
             out.synced_root
         );
+    }
+
+    // A RUN THAT MINED A SHIELD AND THEN FAILED MUST NOT COST A SECOND ONE.
+    //
+    // #243 stopped the probe stranding a note. This is the other half: a note
+    // that IS already there. The first run below mines a shield and sends;
+    // the second is then handed only what the proved `transact(...)` reserves
+    // -- less than a fresh run needs, by construction -- and has to finish out
+    // of the change note the first one left in the contract's tree.
+    //
+    // Driven on a fork because it needs to take the EOA's balance away between
+    // the two runs, which is `anvil_setBalance`; every leg either side of that
+    // is the real one, against real RAILGUN bytecode and the real accumulator.
+    //
+    //   anvil --fork-url <sepolia> --port 8753 --chain-id 11155111 --silent &
+    //   LOGOS_SEPOLIA_RPC=http://127.0.0.1:8753 \
+    //     cargo test --features engine_seam -- --ignored --nocapture a_run_after_a_mined_shield
+    #[test]
+    #[ignore = "needs a FORK of Sepolia (anvil): it sets the EOA's balance between two runs"]
+    fn a_run_after_a_mined_shield_spends_the_note_instead_of_shielding_again() {
+        let chain = RealSepolia::new();
+        let quoted = || {
+            quantity(&chain.rpc("eth_gasPrice", json!([])).expect("a node that quotes gas"))
+                .expect("a gas price")
+        };
+        let fund = |wei: u128| {
+            chain
+                .rpc(
+                    "anvil_setBalance",
+                    json!([probe_eoa_address().to_string(), format!("0x{wei:x}")]),
+                )
+                .expect("anvil_setBalance -- point LOGOS_SEPOLIA_RPC at a fork");
+        };
+
+        fund(price_run(quoted(), DEFAULT_WRAP_SHIELD));
+        let first = block_on(run(chain.clone(), Params::default()));
+        eprintln!("{}", summary(&first));
+        assert!(first.ok(), "the first run has to mine a shield: {:?}", first.needs_funding);
+        assert!(first.shield_tx.is_some(), "the first run shielded nothing");
+        assert!(!first.reused_note, "the first run had nothing to reuse");
+
+        // Everything it had left, taken away. What remains is the note in the
+        // tree and exactly the gas to move it -- which is the position an
+        // operator is in after topping up a run that died past its shield.
+        fund(price_spend(quoted()));
+        let second = block_on(run(chain.clone(), Params::default()));
+        eprintln!("{}", summary(&second));
+        assert!(
+            second.ok(),
+            "a note in the tree plus the transact's own reservation is a run that finishes: {:?}",
+            second.needs_funding.clone().unwrap_or(format!("{second:?}"))
+        );
+        assert!(
+            second.reused_note,
+            "it shielded a SECOND note instead of spending the one already in the tree"
+        );
+        assert_eq!(second.shield_tx, None, "a reused note costs no shield transaction");
+        assert_eq!(second.wrap_tx, None, "and nothing to wrap");
+        assert_eq!(second.root_on_chain, Some(true));
+        assert!(second.transfer_block.is_some(), "the proved transfer was not mined: {second:?}");
     }
 
     // THE WHOLE THING, ON CHAIN. `#[ignore]` because it spends testnet money and
