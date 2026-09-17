@@ -145,6 +145,43 @@ syncer at) and steps only the tail after it. `fastForwardTo` in the reply is tha
 block. A cold sync is then one big window plus a handful of small ones:
 `sync::tests::the_subsquid_half_is_taken_in_one_window` asserts 4, not 469.
 
+**AND THE SECOND SYNC ON THE SAME DEVICE IS THE ANSWER TO "can it be made
+incremental".** Relaunched on the same simulator after the run above — new app
+install, same instance persistence dir — with the frontier fix in:
+
+```
+[shell] CALL OK railgun_module.sync_status() -> {"blocksRemaining":110,"done":false,
+        "fastForwardTo":11720699,"percent":0,"running":false,
+        "startBlock":11720699,"syncedBlock":11720699,"targetBlock":11720809}
+railgun_module: sync 100% (110/110 blocks, at 11720809, target 11720809, eta Nonems)
+[shell] CALL OK railgun_module.sync_step(str:{"budgetMs":120000}) -> {"done":true,
+        "percent":100,"windows":1,"elapsedMs":506,"syncedBlock":11720809}
+```
+
+**110 blocks, one window, 506 ms.** The whole history was synced once; this
+launch synced the blocks since. `DiskDatabase` is what makes that true and it
+was already there — what was missing was a caller that could ask.
+
+**And the driver's ceiling, on the same run.** `--call-timeout 1000` before the
+first `sync_step`:
+
+```
+[shell] CALL FAILED railgun_module.sync_step(str:{"budgetMs":120000}): call to
+        'railgun_module.sync_step' timed out after 1000ms (timeout)
+[shell] call: railgun_module.sync_step(str:{"budgetMs":120000}) was given 1000 ms
+        and is STILL RUNNING -- raise it with --call-timeout <ms> before --call
+```
+
+1 000 ms, not 60 000 — the budget is the call's. The module finished the work
+anyway (the next `sync_step` found the plan complete, `stepMs: 0`), which is the
+failure mode #235 was filed about, now benign and said out loud.
+
+**Arguments are `str:`, not `json:`.** These methods take a `params_json`
+`String`, and the Shell's `json:` prefix builds an OBJECT — which the module
+refuses with `expected string at arg0, got object`. `--call
+'railgun_module.sync_step(str:{"budgetMs":120000})'`; the commas inside the
+braces are the JSON's and the Shell's splitter knows it.
+
 **THE CANCEL PATH IS: STOP CALLING IT**, and that is the whole of it. There is
 nothing to roll back — a sync only READS the chain, `UtxoIndexer::sync_to`
 persists `synced_block` before each window returns, and a later step (or a later
