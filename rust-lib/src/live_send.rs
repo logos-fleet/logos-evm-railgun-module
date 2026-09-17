@@ -279,6 +279,20 @@ pub fn price_spend(fee_wei_per_gas: u128) -> u128 {
     reservation(fee_wei_per_gas.saturating_mul(FEE_DRIFT_MULTIPLE), GAS_TRANSACT)
 }
 
+/// WHY AN ASK IS THE NUMBER IT IS, said in the ask itself: one nobody can check
+/// is one nobody can see has gone stale, and the fee it was priced at is the
+/// thing that moves -- see [`price_run`]. `covers` names the gas the number is
+/// for; a node that would not quote a price leaves the ask at its floor.
+fn priced_at(fee_wei_per_gas: Option<u128>, covers: &str) -> String {
+    match fee_wei_per_gas {
+        Some(fee) => format!(
+            " (priced at the chain's own {fee} wei/gas for {covers}, with room for the fee to \
+             move)"
+        ),
+        None => " (this node would not quote a gas price, so this is the floor)".to_string(),
+    }
+}
+
 /// THE SMALLEST NOTE WORTH SENDING. The transfer is half of what the engine
 /// reports, so a note of one unit splits into a transfer of nothing and is not
 /// the `01x02` operation the rest of this issue measured. Two is the floor the
@@ -570,9 +584,10 @@ pub enum Plan {
     /// probe's, so there is nothing to mint, allow or shield: the run goes
     /// straight from the sync to the proof.
     Spend { token: Address, units: u128 },
-    /// Nothing spendable in the tree. `wrap` is the wei of the EOA's own ETH to
-    /// turn into `token` first.
-    Shield { token: Address, shield: u128, wrap: Option<u128> },
+    /// Nothing spendable in the tree, so the run has to put a note there: it
+    /// shields `units` of `token`, minting `wrap` wei of them out of the EOA's
+    /// own ETH first where the balance is short.
+    Shield { token: Address, units: u128, wrap: Option<u128> },
 }
 
 /// THE OPERATOR ASK, REDUCED TO ONE ASSET. Three #213 cycles stopped on funding,
@@ -624,14 +639,10 @@ pub fn plan(purse: &Purse, asked: Option<u128>, shielded: &[Holding]) -> Result<
                  mined that shield, so this one needs only the gas to SPEND the note -- not to \
                  wrap, allow and shield a second one. Nothing already spent is lost.",
                 purse.eoa,
-                match purse.fee_wei_per_gas {
-                    Some(fee) => format!(
-                        " (priced at the chain's own {fee} wei/gas for the {GAS_TRANSACT} gas of \
-                         the proved transact(...), with room for the fee to move)"
-                    ),
-                    None => " (this node would not quote a gas price, so this is the floor)"
-                        .to_string(),
-                },
+                priced_at(
+                    purse.fee_wei_per_gas,
+                    &format!("the {GAS_TRANSACT} gas of the proved transact(...)"),
+                ),
                 purse.wei,
                 note.units,
                 note.token,
@@ -689,18 +700,13 @@ pub fn plan(purse: &Purse, asked: Option<u128>, shielded: &[Holding]) -> Result<
              rust-lib/src/live_send.rs), so this is a one-time step -- every run after it is \
              unattended.",
             purse.eoa,
-            // WHY THAT NUMBER. An ask nobody can check is an ask nobody can see
-            // has gone stale, and the fee it was priced at is the thing that
-            // moves -- see `price_run`.
-            match purse.fee_wei_per_gas {
-                Some(fee) => format!(
-                    " (priced at the chain's own {fee} wei/gas for {} gas of shield and \
-                     transact, with room for the fee to move)",
+            priced_at(
+                purse.fee_wei_per_gas,
+                &format!(
+                    "{} gas of shield and transact",
                     GAS_WRAP + GAS_APPROVE + GAS_SHIELD + GAS_TRANSACT
                 ),
-                None => " (this node would not quote a gas price, so this is the floor)"
-                    .to_string(),
-            },
+            ),
             purse.wei
         )
     };
@@ -709,16 +715,20 @@ pub fn plan(purse: &Purse, asked: Option<u128>, shielded: &[Holding]) -> Result<
         return Err(ask());
     }
     if purse.erc20.units >= want_erc20 {
-        return Ok(Plan::Shield { token: purse.erc20.token, shield: want_erc20, wrap: None });
+        return Ok(Plan::Shield { token: purse.erc20.token, units: want_erc20, wrap: None });
     }
     let Some(wrapped) = purse.wrapped else {
         return Err(ask());
     };
     if wrapped.units >= want_wrapped {
-        return Ok(Plan::Shield { token: wrapped.token, shield: want_wrapped, wrap: None });
+        return Ok(Plan::Shield { token: wrapped.token, units: want_wrapped, wrap: None });
     }
     if purse.wei >= full_ask {
-        return Ok(Plan::Shield { token: wrapped.token, shield: want_wrapped, wrap: Some(shortfall) });
+        return Ok(Plan::Shield {
+            token: wrapped.token,
+            units: want_wrapped,
+            wrap: Some(shortfall),
+        });
     }
     Err(ask())
 }
@@ -1318,8 +1328,8 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             return out.finished(started);
         }
     };
-    let (token, shield_units, chosen_wrap) = match chosen {
-        Plan::Shield { token, shield, wrap } => (token, shield, wrap),
+    let (token, shield_units, wrap_wei) = match chosen {
+        Plan::Shield { token, units, wrap } => (token, units, wrap),
         Plan::Spend { token, units } => {
             // A NOTE AN EARLIER RUN MINED. Nothing to wrap, allow or shield:
             // the three legs it would take are already paid for, and shielding
@@ -1353,7 +1363,7 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     // again would cost another 731 335 gas and abandon the leaf it left.
     if !out.reused_note {
         // ── mint what is missing, out of the probe's own ETH ─────────────────
-        if let Some(amount) = chosen_wrap {
+        if let Some(amount) = wrap_wei {
             entering("wrap");
             let t = Instant::now();
             out.wrapped_wei = Some(amount);
@@ -1629,12 +1639,11 @@ pub fn summary(r: &Run) -> String {
     let leg = |n: &str| r.leg(n).and_then(|l| l.ms);
     format!(
         "railgun_module: live-send probe: {} (chain={} node={:?}{}{}{} witnessBackend={:?} \
-         eoa={:?} \
-         circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} syncedRootOnChain={:?} \
-         asset={:?} wrappedWei={:?} feeWeiPerGas={:?} \
-         shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
-         approve={:?}ms shield={:?}ms sync={:?}ms/{:?}blocks resync={:?}ms balance={:?}ms \
-         transfer={:?}ms broadcast={:?}ms total={}ms)",
+         eoa={:?} circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} \
+         syncedRootOnChain={:?} asset={:?} wrappedWei={:?} feeWeiPerGas={:?} shieldTx={:?} \
+         transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms approve={:?}ms \
+         shield={:?}ms sync={:?}ms/{:?}blocks resync={:?}ms balance={:?}ms transfer={:?}ms \
+         broadcast={:?}ms total={}ms)",
         if r.ok() { "SENT" } else { "DID NOT" },
         r.chain_id,
         r.node,
@@ -1668,7 +1677,9 @@ pub fn summary(r: &Run) -> String {
         leg("sync"),
         r.sync_from_block.zip(r.sync_to_block).map(|(from, to)| to.saturating_sub(from)),
         leg("resync"),
-        leg("balance").or_else(|| leg("note")),
+        // The survey's own balance leg, which every run that got past the sync
+        // has -- a `note` leg only ever exists behind one.
+        leg("balance"),
         leg("transfer"),
         leg("broadcast"),
         r.total_ms,
@@ -2009,7 +2020,7 @@ mod tests {
     /// decision rather than about a note already in the tree.
     fn shielding(p: Plan) -> (Address, u128, Option<u128>) {
         match p {
-            Plan::Shield { token, shield, wrap } => (token, shield, wrap),
+            Plan::Shield { token, units, wrap } => (token, units, wrap),
             Plan::Spend { token, units } => {
                 panic!("expected a shield plan, got a spend of {units} units of {token}")
             }
@@ -2024,9 +2035,9 @@ mod tests {
     fn eth_alone_is_enough_because_the_probe_mints_its_own_erc20() {
         let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(0)), None, &[])
             .expect("a well-funded-in-ETH account is not a funding ask any more");
-        let (token, shield, wrap) = shielding(chosen);
+        let (token, units, wrap) = shielding(chosen);
         assert_eq!(token, ChainConfig::sepolia().wrapped_base_token);
-        assert_eq!(shield, DEFAULT_WRAP_SHIELD);
+        assert_eq!(units, DEFAULT_WRAP_SHIELD);
         assert_eq!(wrap, Some(DEFAULT_WRAP_SHIELD), "it has to mint the whole amount");
     }
 
@@ -2047,10 +2058,12 @@ mod tests {
     fn a_partial_wrapped_balance_is_topped_up_not_replaced() {
         let held = DEFAULT_WRAP_SHIELD / 4;
         let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(held)), None, &[]).expect("funded");
-        assert_eq!(shielding(chosen).2, Some(DEFAULT_WRAP_SHIELD - held));
+        let (_, _, wrap) = shielding(chosen);
+        assert_eq!(wrap, Some(DEFAULT_WRAP_SHIELD - held));
         let enough =
             plan(&purse(MIN_GAS_WEI * 4, 0, Some(DEFAULT_WRAP_SHIELD)), None, &[]).unwrap();
-        assert_eq!(shielding(enough).2, None);
+        let (_, _, already_wrapped) = shielding(enough);
+        assert_eq!(already_wrapped, None);
     }
 
     // Gas alone, with no room to wrap, is still an ask — and the number in it is
@@ -2157,11 +2170,8 @@ mod tests {
         let dust = [Holding { token: weth, units: 1 }];
         let chosen = plan(&purse(MIN_GAS_WEI * 4, 0, Some(0)), None, &dust)
             .expect("a funded purse is not an ask");
-        assert_eq!(
-            shielding(chosen).2,
-            Some(DEFAULT_WRAP_SHIELD),
-            "it tried to send a note of one unit"
-        );
+        let (_, _, wrap) = shielding(chosen);
+        assert_eq!(wrap, Some(DEFAULT_WRAP_SHIELD), "it tried to send a note of one unit");
     }
 
     // The caller's order is the preference: the run reads the engine's balance
