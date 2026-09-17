@@ -86,7 +86,7 @@
 //! contracts, the tree and `rootOnChain`, and the client version is the only
 //! thing that tells them apart.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy::consensus::{SignableTransaction, TxEip1559};
@@ -97,12 +97,14 @@ use alloy::signers::k256::ecdsa::{RecoveryId, SigningKey};
 use alloy::signers::utils::secret_key_to_address;
 use alloy::sol_types::SolCall;
 use eip_1193_provider::provider::{Eip1193Caller, Eip1193Provider};
+use railgun::account::address::RailgunAddress;
 use railgun::account::chain::ChainId;
 use railgun::account::signer::RailgunSigner;
 use railgun::builder::RailgunBuilder;
 use railgun::caip::AssetId;
 use railgun::chain_config::ChainConfig;
 use railgun::database::memory::MemoryDatabase;
+use railgun::provider::RailgunProvider;
 use serde_json::{json, Value};
 
 use crate::keys;
@@ -254,6 +256,19 @@ pub struct Run {
     /// apart differed by 70 s of sync.
     pub sync_from_block: Option<u64>,
     pub sync_to_block: Option<u64>,
+    /// THE ENGINE'S OWN ROOT, AND THE CONTRACT'S VERDICT ON IT -- the check the
+    /// engine makes at the end of every sync and then throws away, kept. See
+    /// [`RootCheck`].
+    ///
+    /// Not the same claim as [`Run::root_on_chain`], which is about the root a
+    /// PROOF was built over and therefore needs a shielded balance, a shield
+    /// mined and money. This one needs none of them: it says the accumulator
+    /// this device rebuilt out of chain events is, leaf for leaf, the one the
+    /// RAILGUN contract holds -- which is the part of clause 1 an unfunded run
+    /// can still answer.
+    pub synced_tree: Option<u32>,
+    pub synced_root: Option<String>,
+    pub synced_root_on_chain: Option<bool>,
     /// The shielded balance AFTER a real sync of the real tree.
     pub balance: Option<u128>,
     pub transferred: Option<u128>,
@@ -278,6 +293,24 @@ impl Run {
 
     pub fn leg(&self, name: &str) -> Option<&Leg> {
         self.legs.iter().find(|l| l.name == name)
+    }
+
+    /// Record `name` as the leg `r` turned out to be, timed from `t`: a value
+    /// passes through, an error becomes a RED leg and `None`. Callers stop on
+    /// the `None`, so a leg is written exactly once and a failure is timed
+    /// where it happened rather than being reported as an untimed one.
+    fn record_leg<T>(&mut self, name: &'static str, t: Instant, r: Result<T, String>) -> Option<T> {
+        let ms = Some(t.elapsed().as_millis());
+        match r {
+            Ok(v) => {
+                self.legs.push(Leg::timed(name, ms));
+                Some(v)
+            }
+            Err(e) => {
+                self.legs.push(Leg::failed(name, ms, e));
+                None
+            }
+        }
     }
 
     /// The wasm backend the ENGINE generates its witness on in THIS image —
@@ -576,6 +609,245 @@ async fn wrap_native<B: RpcBackend>(
     Ok((tx, block))
 }
 
+// ── the engine's own root check, overheard ──────────────────────────────────
+
+/// ONE `rootHistory(treeNumber, root)` THE ENGINE ASKED, AND WHAT IT WAS TOLD.
+///
+/// At the end of every `sync_to` the engine verifies each tree it has just
+/// written against the deployed `RailgunSmartWallet` — and **drops the answer**:
+/// `UtxoIndexer::verify` propagates an RPC *error* and discards the `bool`, so a
+/// tree that does NOT match the contract syncs green (kohaku `96c835f`,
+/// `crates/railgun/src/indexer/utxo_indexer.rs`). That boolean is exactly what
+/// #213 clause 1 is about, so this probe keeps the verdict the engine throws
+/// away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootCheck {
+    pub tree: u32,
+    pub root: U256,
+    /// What `RailgunSmartWallet.rootHistory` answered about it.
+    pub on_chain: bool,
+}
+
+/// A `bool` as an `eth_call` answers one: a 32-byte word, true when any bit of
+/// it is set — which is how the ABI decoder reads it too.
+fn word_is_true(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| !s.trim_start_matches("0x").trim_start_matches('0').is_empty())
+}
+
+/// An [`RpcBackend`] that passes everything through and remembers the last
+/// [`RootCheck`] the engine made against `smart_wallet`.
+///
+/// OVERHEARD RATHER THAN ASKED AGAIN. The root is a `pub(crate)` of the engine's
+/// indexer and the provider holds the indexer privately, so a consumer cannot
+/// read it — but the engine asks the CONTRACT about it over the provider this
+/// module supplies, and that call is an ordinary `eth_call`. Listening costs no
+/// round trip, needs no seam, and reports the root at the moment the engine
+/// itself had it rather than one re-derived afterwards.
+pub struct RootWatch<B: RpcBackend> {
+    inner: Arc<B>,
+    smart_wallet: Address,
+    last: Mutex<Option<RootCheck>>,
+}
+
+impl<B: RpcBackend> RootWatch<B> {
+    pub fn new(inner: Arc<B>, smart_wallet: Address) -> Self {
+        Self { inner, smart_wallet, last: Mutex::new(None) }
+    }
+
+    /// The last root the engine checked. `None` when it checked none, which is
+    /// what an empty tree looks like — upstream skips a tree with no leaves, and
+    /// inventing a verdict for it would be worse than having none.
+    pub fn last(&self) -> Option<RootCheck> {
+        *self.last.lock().expect("the watch is never held across a panic")
+    }
+
+    /// `[{ "to": …, "data": … }, "latest"]`, as `EthRpcEip1193::eth_call` writes
+    /// it, decoded back into the call the engine made. `None` for every other
+    /// `eth_call` — a run makes many, and only this one is about a root.
+    fn decode_root_history(&self, params: &Value) -> Option<(u32, U256)> {
+        let call = params.get(0)?;
+        let to = call.get("to")?.as_str()?.parse::<Address>().ok()?;
+        if to != self.smart_wallet {
+            return None;
+        }
+        let data = hex::decode(call.get("data")?.as_str()?.trim_start_matches("0x")).ok()?;
+        let asked = rootHistoryCall::abi_decode(&data).ok()?;
+        Some((u32::try_from(asked.treeNumber).ok()?, U256::from_be_bytes(asked.root.0)))
+    }
+}
+
+impl<B: RpcBackend> RpcBackend for RootWatch<B> {
+    fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+        let asked = if method == "eth_call" { self.decode_root_history(&params) } else { None };
+        let answer = self.inner.rpc(method, params);
+        if let (Some((tree, root)), Ok(v)) = (asked, &answer) {
+            *self.last.lock().expect("the watch is never held across a panic") =
+                Some(RootCheck { tree, root, on_chain: word_is_true(v) });
+        }
+        answer
+    }
+}
+
+/// Keep the verdict the engine discarded, and fail on a `false`.
+///
+/// A `false` here means the tree this device rebuilt from chain events is not
+/// the tree the contract holds, so every proof built over it would revert. The
+/// engine syncs green through exactly that, which is why the check lives here.
+fn record_root_check<B: RpcBackend>(out: &mut Run, watch: &RootWatch<B>) -> Result<(), String> {
+    let Some(check) = watch.last() else { return Ok(()) };
+    out.synced_tree = Some(check.tree);
+    out.synced_root = Some(format!("0x{:064x}", check.root));
+    out.synced_root_on_chain = Some(check.on_chain);
+    if check.on_chain {
+        return Ok(());
+    }
+    Err(format!(
+        "the RAILGUN contract does not know the root this engine synced to (tree {}, root \
+         0x{:064x}): the accumulator this device rebuilt is not the one the contract holds, and \
+         any proof over it would revert. The engine's own sync asks this question and drops the \
+         answer, which is why this probe keeps it.",
+        check.tree, check.root
+    ))
+}
+
+// ── the two halves both a send and a survey are made of ─────────────────────
+
+/// The engine, over the REAL syncer and the real tree, with `signer` registered.
+///
+/// THE SYNCER IS TUNED, and this is the leg #235 is about. See [`crate::sync`]:
+/// the engine's own `RpcSyncer` defaults walk whatever subsquid has not indexed
+/// ten blocks at a time with a one-second sleep after each — 100 ms a block,
+/// which was 221 of the 239 seconds this probe took on a physical iPad Air 4.
+///
+/// The database is the caller's rather than handed over and forgotten: the
+/// engine persists `synced_block` into it and exposes no getter, so holding it
+/// is what lets [`sync_windows`] step and report instead of making one opaque
+/// call. `MemoryDatabase`, so a probe run leaves nothing behind — and so this
+/// probe re-walks the tail every time, where a wallet built by [`crate::engine`]
+/// over a `DiskDatabase` walks only the new blocks.
+async fn build_engine(
+    chain: &ChainConfig,
+    eip1193: Arc<dyn Eip1193Provider>,
+    db: Arc<MemoryDatabase>,
+    signer: Arc<dyn RailgunSigner>,
+) -> Result<RailgunProvider, String> {
+    let mut provider = RailgunBuilder::new(chain.clone(), eip1193.clone())
+        .with_database(db)
+        .with_utxo_syncer(sync::utxo_syncer(chain, eip1193, &Tuning::default()))
+        .build()
+        .await
+        .map_err(|e| format!("engine build: {e}"))?;
+    provider
+        .register(signer)
+        .await
+        .map_err(|e| format!("register signer: {e}"))?;
+    Ok(provider)
+}
+
+/// The sync, IN WINDOWS, SAYING WHERE IT IS (#235).
+///
+/// One `provider.sync()` is the same work and reports nothing for as long as it
+/// takes, which on a handset was 221 s of an unresponsive app. Each window
+/// persists before it returns, so a run interrupted here loses none of it — and
+/// so does a USER who walks away, which is the whole of the cancel path: stop
+/// asking for the next one.
+///
+/// The [`SyncPlan`] comes back even when the sync failed, because where it got
+/// to is the interesting half of a failure.
+async fn sync_windows(
+    provider: &mut RailgunProvider,
+    eip1193: &Arc<dyn Eip1193Provider>,
+    chain: &ChainConfig,
+    db: &MemoryDatabase,
+    zk_address: &str,
+) -> (Option<SyncPlan>, Result<(), String>) {
+    let head = match eip1193.get_block_number().await {
+        Ok(b) => b,
+        Err(e) => return (None, Err(format!("eth_blockNumber: {e}"))),
+    };
+    let mut plan = SyncPlan::new(sync::synced_block(db, Some(zk_address)).await, head);
+    // The subsquid half in one window -- see `sync::subsquid_frontier`.
+    if let Some(frontier) = sync::subsquid_frontier(chain).await {
+        plan = plan.with_fast_forward(frontier);
+    }
+    while let Some(end) = plan.next_window_end(sync::DEFAULT_WINDOW_BLOCKS) {
+        let before = plan.synced_block;
+        let (result, ms) = sync::timed(provider.sync_to(end)).await;
+        if let Err(e) = result {
+            return (Some(plan), Err(format!("sync: {e}")));
+        }
+        plan.record(sync::synced_block(db, Some(zk_address)).await, ms);
+        sync::report(&plan);
+        if plan.synced_block <= before {
+            // The engine will not pass this block, so neither will another turn
+            // of this loop. Say where it stopped rather than spinning.
+            let stalled =
+                format!("sync stalled at block {} of {}", plan.synced_block, plan.target_block);
+            return (Some(plan), Err(stalled));
+        }
+    }
+    (Some(plan), Ok(()))
+}
+
+/// EVERY LEG MONEY IS NOT NEEDED FOR — what an unfunded run does instead of
+/// stopping.
+///
+/// #213 clause 1 has been one testnet transfer away for several cycles, and the
+/// issue asks that a cycle still produce a measurement while it waits. Nothing
+/// in a sync costs anything: the engine is built over the real default syncer,
+/// the real accumulator is walked to the live tip, the root it arrives at is
+/// checked against the contract ([`record_root_check`]) and the shielded balance
+/// is read. That is the leg which DOMINATES a private send's wall clock (#235:
+/// 221 of 239 seconds before it was tuned) and the only one of them that has
+/// never been measured against the public chain on a device — every figure so
+/// far came from a local fork, whose tip does not move and whose node is on the
+/// same desk.
+///
+/// IT IS NOT A SEND AND MUST NOT READ LIKE ONE. The `funding` leg is already
+/// red when this is reached, so [`Run::ok`] stays false, [`summary`] says
+/// `DID NOT` and prints `SURVEY-ONLY-UNFUNDED`, and nothing here signs anything.
+async fn survey<B: RpcBackend>(
+    out: &mut Run,
+    chain: &ChainConfig,
+    eip1193: Arc<dyn Eip1193Provider>,
+    watch: &RootWatch<B>,
+    signer: Arc<dyn RailgunSigner>,
+    from: RailgunAddress,
+) {
+    entering("engine");
+    let t = Instant::now();
+    let db = Arc::new(MemoryDatabase::new());
+    let built = build_engine(chain, eip1193.clone(), db.clone(), signer).await;
+    let Some(mut provider) = out.record_leg("engine", t, built) else { return };
+
+    entering("sync");
+    let t = Instant::now();
+    let zk_address = from.to_string();
+    let (plan, synced) =
+        sync_windows(&mut provider, &eip1193, chain, db.as_ref(), &zk_address).await;
+    if let Some(plan) = &plan {
+        out.sync_from_block = Some(plan.start_block);
+        out.sync_to_block = Some(plan.target_block);
+    }
+    if out.record_leg("sync", t, synced).is_none() {
+        return;
+    }
+
+    let t = Instant::now();
+    let checked = record_root_check(out, watch);
+    if out.record_leg("synced-root", t, checked).is_none() {
+        return;
+    }
+
+    entering("balance");
+    let t = Instant::now();
+    // Every asset, not one: a survey has chosen no asset to shield, and a
+    // balance the probe did not expect is worth seeing rather than filtering out.
+    let balance: u128 = provider.balance(from).await.iter().map(|b| b.amount).sum();
+    out.balance = Some(balance);
+    out.legs.push(Leg::timed("balance", Some(t.elapsed().as_millis())));
+}
+
 // ── the run ─────────────────────────────────────────────────────────────────
 
 /// THE WHOLE THING, on the real chain.
@@ -607,7 +879,12 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
         .unwrap_or_else(|| SEPOLIA_USDC.parse().expect("the fixture token address is a literal"));
     let mintable = p.asset.is_none().then_some(chain.wrapped_base_token);
 
-    let eip1193: Arc<dyn Eip1193Provider> = Arc::new(EthRpcEip1193::new(backend.clone()));
+    // THE ENGINE'S PROVIDER, LISTENED TO. Everything the engine reads goes
+    // through here, including the `rootHistory` it asks about its own tree at
+    // the end of every sync and then discards -- see `RootWatch`. The EOA keeps
+    // the bare backend: its transactions are not the engine's reads.
+    let watch = Arc::new(RootWatch::new(backend.clone(), smart_wallet));
+    let eip1193: Arc<dyn Eip1193Provider> = Arc::new(EthRpcEip1193::new(watch.clone()));
     let eoa = Eoa::new(backend.clone(), p.chain_id);
     out.eoa = Some(eoa.address.to_string());
 
@@ -637,6 +914,9 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     };
     let from = signer.address();
     let to = recipient.address();
+    // The engine takes the signer as a trait object, and either a send or a
+    // survey hands it over -- coerced once here rather than at both call sites.
+    let engine_signer: Arc<dyn RailgunSigner> = signer.clone();
     out.from = Some(from.to_string());
     out.to = Some(to.to_string());
     out.legs.push(Leg::timed("keys", None));
@@ -678,6 +958,11 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             out.token_units = Some(purse.erc20.units);
             out.needs_funding = Some(ask.clone());
             out.legs.push(Leg::failed("funding", Some(t.elapsed().as_millis()), ask));
+            // NOT THE END OF THE RUN. Nothing past here can be signed, but the
+            // chain reads cost nothing and the sync is the leg that dominates a
+            // private send -- see `survey`.
+            survey(&mut out, &chain, eip1193.clone(), watch.as_ref(), engine_signer, from.clone())
+                .await;
             return out.finished(started);
         }
     };
@@ -712,36 +997,11 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     // ── the engine, over the REAL syncer and the real tree ─────────────────
     entering("engine");
     let t = Instant::now();
-    // THE SYNCER IS TUNED, and this is the leg #235 is about. See
-    // `crate::sync`: the engine's own `RpcSyncer` defaults walk whatever
-    // subsquid has not indexed ten blocks at a time with a one-second sleep
-    // after each -- 100 ms a block, which was 221 of the 239 seconds this probe
-    // took on a physical iPad Air 4.
-    //
-    // The database is held rather than handed over and forgotten: the engine
-    // persists `synced_block` into it and exposes no getter, so this is what
-    // lets the sync below be STEPPED and reported instead of being one opaque
-    // call. `MemoryDatabase` still, so a probe run leaves nothing behind -- and
-    // that also means this probe re-walks the tail every time, where a wallet
-    // built by `crate::engine` over a `DiskDatabase` walks only the new blocks.
     let db = Arc::new(MemoryDatabase::new());
-    let build = RailgunBuilder::new(chain.clone(), eip1193.clone())
-        .with_database(db.clone())
-        .with_utxo_syncer(sync::utxo_syncer(&chain, eip1193.clone(), &Tuning::default()))
-        .build()
-        .await;
-    let mut provider = match build {
-        Ok(p) => p,
-        Err(e) => {
-            out.legs.push(Leg::failed("engine", None, format!("engine build: {e}")));
-            return out.finished(started);
-        }
-    };
-    if let Err(e) = provider.register(signer.clone() as Arc<dyn RailgunSigner>).await {
-        out.legs.push(Leg::failed("engine", None, format!("register signer: {e}")));
+    let built = build_engine(&chain, eip1193.clone(), db.clone(), engine_signer).await;
+    let Some(mut provider) = out.record_leg("engine", t, built) else {
         return out.finished(started);
-    }
-    out.legs.push(Leg::timed("engine", Some(t.elapsed().as_millis())));
+    };
 
     // ── approve, if the smart wallet may not already move the tokens ───────
     entering("approve");
@@ -812,53 +1072,28 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     }
 
     // ── the sync: the whole of Sepolia's tree, our note among it ───────────
-    //
-    // IN WINDOWS, AND IT SAYS WHERE IT IS (#235). One `provider.sync()` is the
-    // same work and reports nothing for as long as it takes, which on a handset
-    // was 221 s of an unresponsive app. Each window persists before it returns,
-    // so a run interrupted here loses none of it -- and so does a USER who walks
-    // away, which is the whole of the cancel path: stop asking for the next one.
     entering("sync");
     let t = Instant::now();
-    let head = match eip1193.get_block_number().await {
-        Ok(b) => b,
-        Err(e) => {
-            out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()),
-                                      format!("eth_blockNumber: {e}")));
-            return out.finished(started);
-        }
-    };
     // The account whose record says how far the sync has got -- this probe's own
     // `0zk`, the one `sync::synced_block` takes the minimum against.
     let zk_address = from.to_string();
-    let mut plan = SyncPlan::new(sync::synced_block(db.as_ref(), Some(&zk_address)).await, head);
-    // The subsquid half in one window -- see `sync::subsquid_frontier`.
-    if let Some(frontier) = sync::subsquid_frontier(&chain).await {
-        plan = plan.with_fast_forward(frontier);
+    let (plan, synced) =
+        sync_windows(&mut provider, &eip1193, &chain, db.as_ref(), &zk_address).await;
+    if let Some(plan) = &plan {
+        out.sync_from_block = Some(plan.start_block);
+        out.sync_to_block = Some(plan.target_block);
     }
-    out.sync_from_block = Some(plan.start_block);
-    out.sync_to_block = Some(plan.target_block);
-    while let Some(end) = plan.next_window_end(sync::DEFAULT_WINDOW_BLOCKS) {
-        let before = plan.synced_block;
-        let (result, ms) = sync::timed(provider.sync_to(end)).await;
-        if let Err(e) = result {
-            out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()), format!("sync: {e}")));
-            return out.finished(started);
-        }
-        plan.record(sync::synced_block(db.as_ref(), Some(&zk_address)).await, ms);
-        sync::report(&plan);
-        if plan.synced_block <= before {
-            // The engine will not pass this block, so neither will another turn
-            // of this loop. Say where it stopped rather than spinning.
-            out.legs.push(Leg::failed(
-                "sync",
-                Some(t.elapsed().as_millis()),
-                format!("sync stalled at block {} of {}", plan.synced_block, plan.target_block),
-            ));
-            return out.finished(started);
-        }
+    if out.record_leg("sync", t, synced).is_none() {
+        return out.finished(started);
     }
-    out.legs.push(Leg::timed("sync", Some(t.elapsed().as_millis())));
+
+    // And the verdict the engine asked for and threw away -- read BEFORE the
+    // `root-on-chain` leg below asks its own question through the same watch.
+    let t = Instant::now();
+    let checked = record_root_check(&mut out, watch.as_ref());
+    if out.record_leg("synced-root", t, checked).is_none() {
+        return out.finished(started);
+    }
 
     // ── a shielded balance a transaction put there ─────────────────────────
     entering("balance");
@@ -1016,8 +1251,9 @@ pub fn report(r: &Run) {
 pub fn summary(r: &Run) -> String {
     let leg = |n: &str| r.leg(n).and_then(|l| l.ms);
     format!(
-        "railgun_module: live-send probe: {} (chain={} node={:?}{} witnessBackend={:?} eoa={:?} \
-         circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} \
+        "railgun_module: live-send probe: {} (chain={} node={:?}{}{} witnessBackend={:?} eoa={:?} \
+         circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} syncedRootOnChain={:?} \
+         asset={:?} wrappedWei={:?} \
          shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
          approve={:?}ms shield={:?}ms sync={:?}ms/{:?}blocks balance={:?}ms transfer={:?}ms \
          broadcast={:?}ms total={}ms)",
@@ -1025,12 +1261,16 @@ pub fn summary(r: &Run) -> String {
         r.chain_id,
         r.node,
         if r.forked { " FORK-NOT-PUBLIC-SEPOLIA" } else { "" },
+        // A run that could not pay measured the chain and sent nothing. Said in
+        // the line itself, because the timings below it look like a send's.
+        if r.needs_funding.is_some() { " SURVEY-ONLY-UNFUNDED" } else { "" },
         r.witness_backend(),
         r.eoa,
         r.circuit,
         r.balance,
         r.transferred,
         r.root_on_chain,
+        r.synced_root_on_chain,
         r.asset,
         r.wrapped_wei,
         r.shield_tx,
@@ -1159,10 +1399,13 @@ mod tests {
         assert!(chain.asked().is_empty(), "it touched the chain: {:?}", chain.asked());
     }
 
-    // An unfunded run is a HANDOFF, not a crash: it must name the address, say
-    // what to send, and stop before it builds an engine or signs anything.
+    // An unfunded run is a HANDOFF, not a crash: it must name the address and
+    // say what to send. It must also SPEND NOTHING -- but "spend nothing" is not
+    // "do nothing", and this is the difference (#213 clause 1). The chain reads
+    // a survey makes are free, so the run carries on into every leg money is not
+    // needed for and stops only before the first signature.
     #[test]
-    fn an_unfunded_eoa_reports_the_ask_and_builds_no_engine() {
+    fn an_unfunded_eoa_reports_the_ask_and_still_surveys_the_chain() {
         let chain = Canned::with(&[
             ("eth_getBalance", json!("0x0")),
             ("eth_call", word(0)), // balanceOf
@@ -1170,18 +1413,27 @@ mod tests {
         let out = block_on(run(chain.clone(), Params::default()));
         assert!(!out.ok());
         assert_eq!(out.eoa, Some(probe_eoa_address().to_string()));
-        let ask = out.needs_funding.expect("an unfunded run must say what it needs");
+        let ask = out.needs_funding.clone().expect("an unfunded run must say what it needs");
         assert!(ask.contains(&probe_eoa_address().to_string()), "{ask}");
         assert!(
             ask.contains(&(MIN_GAS_WEI + DEFAULT_WRAP_SHIELD).to_string()),
             "the ask must be ONE number in ETH -- gas plus what it wraps: {ask}"
         );
         assert!(ask.contains("wrapping"), "and it must say ETH is all it needs: {ask}");
-        assert_eq!(
-            out.legs.iter().map(|l| l.name).collect::<Vec<_>>(),
-            vec!["keys", "funding"],
-            "it went past the funding check"
+        // The `funding` leg is RED and stays red, so `ok()` is false and the
+        // summary says DID NOT -- a survey must never read like a send.
+        assert!(!out.leg("funding").expect("a funding leg").ok());
+        assert!(
+            out.legs.iter().any(|l| l.name == "engine"),
+            "it stopped at the funding ask instead of surveying: {:?}",
+            out.legs.iter().map(|l| l.name).collect::<Vec<_>>()
         );
+        assert!(
+            summary(&out).contains("SURVEY-ONLY-UNFUNDED"),
+            "a survey has to be unmistakable in the one line it is judged by: {}",
+            summary(&out)
+        );
+        // And the line nothing may cross without money.
         assert!(!chain.asked().iter().any(|m| m == "eth_sendRawTransaction"));
     }
 
@@ -1261,6 +1513,95 @@ mod tests {
         assert_eq!(out.node, None);
         assert!(!out.forked, "an unknown node is not a fork, it is unknown");
         assert!(out.needs_funding.is_some(), "it stopped before the funding leg: {out:?}");
+    }
+
+    // ── the root the engine checks and then forgets ────────────────────────
+
+    /// The `eth_call` the engine makes to verify a tree, shaped exactly as
+    /// `EthRpcEip1193::eth_call` writes it.
+    fn root_history_call(to: Address, tree: u32, root: U256) -> Value {
+        let data = rootHistoryCall { treeNumber: U256::from(tree), root: root.into() }.abi_encode();
+        json!([{ "to": format!("{to:?}"), "data": format!("0x{}", hex::encode(data)) }, "latest"])
+    }
+
+    // THE VERDICT UPSTREAM THROWS AWAY. `UtxoIndexer::verify` asks the contract
+    // whether it knows the root of every tree it has just synced -- and keeps
+    // only the RPC error, dropping the `bool`. So an engine whose tree has
+    // diverged from the contract's syncs GREEN, and every proof it then builds
+    // reverts. The probe cannot make upstream keep the answer; it can overhear
+    // it, because the question goes out over the provider this module supplies.
+    #[test]
+    fn the_engines_own_root_check_is_overheard() {
+        let wallet = ChainConfig::sepolia().railgun_smart_wallet;
+        let root = U256::from(0x1234_5678u64);
+        let chain = Canned::with(&[("eth_call", word(1))]);
+        let watch = RootWatch::new(chain, wallet);
+        assert_eq!(watch.last(), None, "it invented a check nobody made");
+        watch.rpc("eth_call", root_history_call(wallet, 3, root)).expect("answered");
+        assert_eq!(watch.last(), Some(RootCheck { tree: 3, root, on_chain: true }));
+    }
+
+    // And it is the ROOT CHECK it keeps, not any `eth_call`: a run makes many
+    // (balanceOf, allowance), and one of them landing in this field would report
+    // a token balance as a merkle root.
+    #[test]
+    fn an_ordinary_eth_call_is_not_a_root_check() {
+        let wallet = ChainConfig::sepolia().railgun_smart_wallet;
+        let elsewhere: Address = SEPOLIA_USDC.parse().unwrap();
+        let chain = Canned::with(&[("eth_call", word(1)), ("eth_blockNumber", word(9))]);
+        let watch = RootWatch::new(chain, wallet);
+        // Right contract, wrong call.
+        let balance = json!([
+            { "to": format!("{wallet:?}"), "data": format!("0x{}", hex::encode(
+                balanceOfCall { owner: probe_eoa_address() }.abi_encode())) },
+            "latest"
+        ]);
+        watch.rpc("eth_call", balance).expect("answered");
+        assert_eq!(watch.last(), None, "a balanceOf was read as a root check");
+        // Right call, wrong contract -- a root another deployment knows is not
+        // evidence about this one.
+        watch.rpc("eth_call", root_history_call(elsewhere, 0, U256::from(7))).expect("answered");
+        assert_eq!(watch.last(), None, "another contract's root was read as ours");
+        // And nothing that is not an `eth_call` at all.
+        watch.rpc("eth_blockNumber", json!([])).expect("answered");
+        assert_eq!(watch.last(), None);
+    }
+
+    // A ROOT THE CONTRACT DOES NOT KNOW IS A FAILED RUN. This is the whole
+    // reason the verdict is kept: upstream's `verify()` returns `Ok(())` for
+    // exactly this answer, so without this the sync leg goes green over a tree
+    // that has diverged and the failure surfaces 200 s later as a reverted
+    // `transact(...)` -- or, on an unfunded survey, not at all.
+    #[test]
+    fn a_root_the_contract_does_not_know_is_reported_and_fatal() {
+        let wallet = ChainConfig::sepolia().railgun_smart_wallet;
+        let root = U256::from(0xdeadbeefu64);
+        let chain = Canned::with(&[("eth_call", word(0))]); // rootHistory -> false
+        let watch = RootWatch::new(chain, wallet);
+        watch.rpc("eth_call", root_history_call(wallet, 2, root)).expect("answered");
+
+        let mut out = Run::default();
+        let err = record_root_check(&mut out, &watch).expect_err("a false root must stop the run");
+        assert!(err.contains("does not know the root"), "{err}");
+        assert_eq!(out.synced_tree, Some(2), "the tree has to be named: the answer is per tree");
+        assert_eq!(out.synced_root, Some(format!("0x{root:064x}")));
+        assert_eq!(out.synced_root_on_chain, Some(false));
+        assert!(
+            summary(&out).contains("syncedRootOnChain=Some(false)"),
+            "the one line a run is judged by must carry it: {}",
+            summary(&out)
+        );
+    }
+
+    // An engine that checked nothing is not an engine that failed: `verify()`
+    // skips a tree with no leaves, and inventing a verdict for that would be a
+    // worse answer than having none.
+    #[test]
+    fn an_engine_that_checked_no_root_is_not_a_failure() {
+        let watch = RootWatch::new(Canned::with(&[]), ChainConfig::sepolia().railgun_smart_wallet);
+        let mut out = Run::default();
+        record_root_check(&mut out, &watch).expect("nothing checked is not a failure");
+        assert_eq!(out.synced_root_on_chain, None);
     }
 
     // ── the funding decision, which is the whole of the operator ask ───────
@@ -1605,6 +1946,40 @@ mod tests {
         assert!(
             !said.contains("sender") && !said.contains("signature"),
             "the node did not recover the sender from our signature: {err}"
+        );
+    }
+
+    // THE HALF OF CLAUSE 1 THAT NEEDS NO MONEY, ON THE PUBLIC CHAIN.
+    //
+    // #213 clause 1 wants a shield mined on public Sepolia, and that is one
+    // operator transfer away. Everything else the clause protects can be
+    // measured without a penny: the engine builds over the DEFAULT syncer,
+    // walks the real public accumulator to the LIVE tip -- which, unlike a
+    // fork's, moves while the walk is going on -- and arrives at a root the
+    // deployed RAILGUN contract confirms it knows. What a funded run would add
+    // is a note of the probe's own in that tree.
+    //
+    // Asserted rather than printed, because each of the three is a real claim:
+    // the run must not spend, the survey must complete, and the root must be
+    // one the contract knows.
+    //
+    //   cargo test --features engine_seam -- --ignored --nocapture an_unfunded_run
+    #[test]
+    #[ignore = "needs the network and syncs the real Sepolia UTXO tree"]
+    fn an_unfunded_run_still_surveys_the_public_chain() {
+        let out = block_on(run(RealSepolia::new(), Params::default()));
+        eprintln!("{}", summary(&out));
+        assert!(out.needs_funding.is_some(), "the probe EOA is funded -- run the_whole_send");
+        assert!(!out.ok(), "a survey must never report itself as a send");
+        for leg in ["engine", "sync", "synced-root", "balance"] {
+            let l = out.leg(leg).unwrap_or_else(|| panic!("no {leg} leg: {:?}", out.legs));
+            assert!(l.ok(), "{leg}: {:?}", l.error);
+        }
+        assert_eq!(
+            out.synced_root_on_chain,
+            Some(true),
+            "the contract does not know the root this device synced to: {:?}",
+            out.synced_root
         );
     }
 

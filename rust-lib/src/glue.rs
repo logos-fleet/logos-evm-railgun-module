@@ -246,7 +246,8 @@ pub trait RailgunModule: 'static {
     /// `{ "asset"?, "shield"?, "transfer"?, "memo"?, "broadcast"?, "confirmMs"? }`
     /// → `{ ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits,
     /// needsFunding?, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx,
-    /// shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes,
+    /// shieldBlock, syncFromBlock, syncToBlock, balance, transferred, circuit,
+    /// rootOnChain, syncedTree, syncedRoot, syncedRootOnChain, calldataBytes,
     /// transferTx, transferBlock, totalMs, legs: [{ name, ms, ok, error? }] }`.
     ///
     /// `node` / `forked` say WHOSE chain answered, because a fork of Sepolia
@@ -269,10 +270,23 @@ pub trait RailgunModule: 'static {
     /// cannot sign for an agent (keystore needs a human and a password) and a
     /// probe must never hold anything worth taking. Sepolia only, refused before
     /// any chain read otherwise. Until an operator funds that address every run
-    /// stops at the `funding` leg and reports what to send — and what to send is
-    /// **Sepolia ETH and nothing else**: with no ERC-20 in hand the probe mints
-    /// its own by wrapping some of its ETH into the chain's wrapped base token
-    /// (`wrap` leg), which RAILGUN shields like any other ERC-20.
+    /// reports what to send in `needsFunding` — and what to send is **Sepolia
+    /// ETH and nothing else**: with no ERC-20 in hand the probe mints its own by
+    /// wrapping some of its ETH into the chain's wrapped base token (`wrap`
+    /// leg), which RAILGUN shields like any other ERC-20.
+    ///
+    /// An unfunded run then SURVEYS rather than stopping: it still builds the
+    /// engine, walks the real accumulator to the live tip and checks the root it
+    /// arrives at against the contract (`syncedRootOnChain`) — every leg money
+    /// is not needed for, including the one that dominates a private send's wall
+    /// clock. `ok` stays false and the summary says `SURVEY-ONLY-UNFUNDED`,
+    /// because a survey is not a send.
+    ///
+    /// `syncedRootOnChain` is the verdict the ENGINE asks for at the end of
+    /// every sync and then discards (kohaku's `UtxoIndexer::verify` keeps the
+    /// RPC error and drops the `bool`): `true` means the accumulator this device
+    /// rebuilt from chain events is the one the RAILGUN contract holds. Unlike
+    /// `rootOnChain` it needs no shielded balance.
     /// See [`crate::live_send`].
     fn live_send_probe(&mut self, params_json: String) -> String;
     /// CAN THIS MODULE REACH ITS `web` DEPENDENCY?
@@ -1041,10 +1055,20 @@ impl RailgunModule for RailgunModuleImpl {
             "approveTx": run.approve_tx,
             "shieldTx": run.shield_tx,
             "shieldBlock": run.shield_block,
+            // Where the sync started and where it was going: the `sync` leg's
+            // milliseconds mean nothing without them (#235).
+            "syncFromBlock": run.sync_from_block,
+            "syncToBlock": run.sync_to_block,
             "balance": run.balance.map(|v| v.to_string()),
             "transferred": run.transferred.map(|v| v.to_string()),
             "circuit": run.circuit,
             "rootOnChain": run.root_on_chain,
+            // The root the ENGINE synced to and what the contract said about
+            // it — the check upstream makes and discards. Needs no money, so an
+            // unfunded survey carries it too.
+            "syncedTree": run.synced_tree,
+            "syncedRoot": run.synced_root,
+            "syncedRootOnChain": run.synced_root_on_chain,
             "calldataBytes": run.calldata_bytes,
             "transferTx": run.transfer_tx,
             "transferBlock": run.transfer_block,
