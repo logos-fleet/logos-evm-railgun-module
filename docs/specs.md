@@ -775,7 +775,7 @@ is point-to-point), so `netstat -an -p tcp | grep 8645` is the only proof the
 bind took. Keep loopback bound for your own calls.
 
 **iPad Air (4th generation), iOS 26.5.2, release build, forked at Sepolia block
-11 719 924:**
+11 720 020:**
 
 ```
 railgun_module: live-send probe: SENT (chain=11155111 node=Some("anvil/v1.8.1")
@@ -783,8 +783,8 @@ railgun_module: live-send probe: SENT (chain=11155111 node=Some("anvil/v1.8.1")
   eoa=Some("0x23cc…1722") circuit=Some("01x02") shielded=Some(99750000000000)
   transferred=Some(49875000000000) rootOnChain=Some(true)
   asset=Some("erc20:0xfff9…6b14") calldata=Some(1956)B
-  funding=454ms wrap=2882ms engine=10ms approve=391ms shield=4120ms
-  sync=210101ms balance=0ms transfer=3912ms broadcast=4056ms total=226014ms)
+  funding=534ms wrap=2948ms engine=9ms approve=2484ms shield=4257ms
+  sync=220815ms balance=0ms transfer=3636ms broadcast=4198ms total=238966ms)
 ```
 
 `railgun: witness store backend = wasmi (#188 iOS: the interpreter, no JIT)` is
@@ -792,17 +792,19 @@ printed immediately before the `transfer` leg — from inside the vendored
 `calculate_witness`, over the real circuit inputs of a note the contract's own
 tree holds, rather than over the shape-correct placeholders `proof_circuit_probe`
 must use. Both transactions were mined by the RAILGUN contract: shield
-`status 0x1`, block 11 719 927, 731 371 gas, 3 events; the proved `transact(...)`
-`status 0x1`, block 11 719 928, **1 008 286 gas**, 2 events, to
+`status 0x1`, block 11 720 023, 731 335 gas, 3 events; the proved `transact(...)`
+`status 0x1`, block 11 720 024, **1 008 274 gas**, 2 events, to
 `0xeCFCf3b4…3fea`. The contract's verifier accepted a Groth16 proof an A14 iPad
-produced **on the interpreter**.
+produced **on the interpreter**. Reproduced on a second fork of the same chain
+(`transfer=3912ms`, `total=226014ms`, 1 008 286 gas), so the figures below are
+not one lucky run.
 
 **What the interpreter costs, end to end: almost nothing.** `transfer` — the
 engine's own witness, `Groth16Prover::prove`, verify and the artifact fetch —
-is **3912 ms** on the A14 under `wasmi`, against **3719 ms** on an M2 simulator
-under cranelift and #222's `total=4509ms` for the same three legs over
-placeholder values. The 226 s a private send takes on this handset is **210 s of
-accumulator sync**; the proving half is under 2 % of it. So a progress UI and a
+is **3636 ms** (3912 ms on the second run) on the A14 under `wasmi`, against
+**3719 ms** on an M2 simulator under cranelift and #222's `total=4509ms` for the
+same three legs over placeholder values. The 239 s a private send takes on this
+handset is **221 s of accumulator sync**; the proving half is under 2 % of it. So a progress UI and a
 cancel path are needed for the SYNC, and #188's JIT-off patch costs the user
 nothing measurable.
 
