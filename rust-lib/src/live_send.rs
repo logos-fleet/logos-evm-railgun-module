@@ -184,8 +184,14 @@ pub const GAS_SHIELD: u128 = 731_335;
 /// largest single reservation a run makes, and the last one it makes.
 pub const GAS_TRANSACT: u128 = 1_008_274;
 
-/// [`Eoa::send`] prices at twice the chain's own `eth_gasPrice`, so that is the
-/// ceiling a node reserves against -- not the fee the transaction will pay.
+/// [`Eoa::send`] sets `max_fee_per_gas` to twice the chain's own `eth_gasPrice`
+/// -- plus a priority tip, which this leaves out. A node reserves against that
+/// ceiling, not against the fee the transaction will actually pay.
+///
+/// Leaving the tip out is covered at the `funding` leg, where
+/// [`FEE_DRIFT_MULTIPLE`] makes the ask hold 4x the quoted price per unit of
+/// limit against a ceiling of 2x plus the tip. [`can_still_transact`] has no
+/// such margin and so under-states each reservation by the tip over the limit.
 const MAX_FEE_MULTIPLE: u128 = 2;
 
 /// AND THE BASE FEE MOVES WHILE A RUN IS IN FLIGHT. Four transactions and a
@@ -194,10 +200,20 @@ const MAX_FEE_MULTIPLE: u128 = 2;
 /// printed is wrong by the time it is funded.
 const FEE_DRIFT_MULTIPLE: u128 = 2;
 
-/// [`Eoa::gas_limit`] asks the node and adds 30 %. The RESERVATION a node checks
-/// a balance against is that limit, not the estimate under it.
-fn limit(gas: u128) -> u128 {
+/// The 30 % [`Eoa::gas_limit`] puts over an `eth_estimateGas`, written once so
+/// the pricing and the sending cannot drift apart. The limit is what a node
+/// checks a balance against, not the estimate under it.
+fn with_headroom(gas: u128) -> u128 {
     gas.saturating_mul(13) / 10
+}
+
+/// WHAT A NODE MAKES AN ACCOUNT HOLD to accept one transaction: it refuses
+/// `eth_sendRawTransaction` unless the balance covers
+/// `gas_limit * max_fee_per_gas + value`, and both factors are larger than what
+/// the transaction goes on to use -- see [`with_headroom`] and
+/// [`MAX_FEE_MULTIPLE`]. The `value` is the caller's to add.
+fn reservation(fee_wei_per_gas: u128, gas: u128) -> u128 {
+    fee_wei_per_gas.saturating_mul(MAX_FEE_MULTIPLE).saturating_mul(with_headroom(gas))
 }
 
 /// WHAT THE PROBE'S EOA MUST HOLD FOR ONE WHOLE SEND, at a fee the chain has
@@ -218,7 +234,7 @@ fn limit(gas: u128) -> u128 {
 pub fn price_run(fee_wei_per_gas: u128, wrap: u128) -> u128 {
     let drifted = fee_wei_per_gas.saturating_mul(FEE_DRIFT_MULTIPLE);
     let spent = drifted.saturating_mul(GAS_WRAP + GAS_APPROVE + GAS_SHIELD);
-    let held_back = drifted.saturating_mul(MAX_FEE_MULTIPLE).saturating_mul(limit(GAS_TRANSACT));
+    let held_back = reservation(drifted, GAS_TRANSACT);
     wrap.saturating_add(spent)
         .saturating_add(held_back)
         .max(MIN_GAS_WEI.saturating_add(wrap))
@@ -236,27 +252,30 @@ pub fn price_run(fee_wei_per_gas: u128, wrap: u128) -> u128 {
 /// later costs a shielded balance as well, and that is the expensive half of
 /// #213 clause 1: a shield has to be re-mined and re-synced, the funds cannot.
 pub fn can_still_transact(wei: u128, fee_wei_per_gas: u128) -> Result<(), String> {
-    let max_fee = fee_wei_per_gas.saturating_mul(MAX_FEE_MULTIPLE);
-    let top_up = format!(
-        "Top {} up and run again -- nothing has been shielded, so nothing is stranded.",
-        probe_eoa_address()
-    );
-    let shield_reservation = max_fee.saturating_mul(limit(GAS_SHIELD));
+    // Every refusal says the same two things -- what it is protecting and what
+    // to do about it -- so only the reason in the middle is written twice.
+    let refuse = |why: String| -> Result<(), String> {
+        Err(format!(
+            "stopping BEFORE the shield: {why} Top {} up and run again -- nothing has been \
+             shielded, so nothing is stranded.",
+            probe_eoa_address()
+        ))
+    };
+    let shield_reservation = reservation(fee_wei_per_gas, GAS_SHIELD);
     if wei < shield_reservation {
-        return Err(format!(
-            "stopping BEFORE the shield: at the chain's current {fee_wei_per_gas} wei/gas \
-             the shield alone reserves {shield_reservation} wei and this EOA holds {wei}. \
-             {top_up}"
+        return refuse(format!(
+            "at the chain's current {fee_wei_per_gas} wei/gas the shield alone reserves \
+             {shield_reservation} wei and this EOA holds {wei}."
         ));
     }
     let after = wei.saturating_sub(fee_wei_per_gas.saturating_mul(GAS_SHIELD));
-    let transact_reservation = max_fee.saturating_mul(limit(GAS_TRANSACT));
+    let transact_reservation = reservation(fee_wei_per_gas, GAS_TRANSACT);
     if after < transact_reservation {
-        return Err(format!(
-            "stopping BEFORE the shield: it would leave {after} wei and the proved \
-             transact(...) reserves {transact_reservation} at the chain's current \
-             {fee_wei_per_gas} wei/gas. Shielding now would put a note in the contract's tree \
-             that this EOA could not then spend. {top_up}"
+        return refuse(format!(
+            "it would leave {after} wei and the proved transact(...) reserves \
+             {transact_reservation} at the chain's current {fee_wei_per_gas} wei/gas. \
+             Shielding now would put a note in the contract's tree that this EOA could not \
+             then spend."
         ));
     }
     Ok(())
@@ -503,7 +522,8 @@ pub struct Plan {
 ///
 /// Pure, and ordered so the answer is never surprising:
 ///
-/// 1. no gas -> ask, whatever else is held (nothing can be signed without it);
+/// 1. not enough ETH for the whole run -> ask, whatever else is held (see
+///    `gas_only` below: the last leg's reservation is due whatever is shielded);
 /// 2. enough of the preferred ERC-20 -> shield that, wrap nothing;
 /// 3. a named asset that is short -> ask, naming it (nothing to mint);
 /// 4. enough of the wrapped base token already -> shield that, wrap nothing;
@@ -678,7 +698,7 @@ impl<B: RpcBackend> Eoa<B> {
             "data": format!("0x{}", hex::encode(data)),
         });
         let est = quantity(&self.rpc("eth_estimateGas", json!([tx]))?)?;
-        Ok((est.saturating_mul(13) / 10).min(u64::MAX as u128) as u64)
+        Ok(with_headroom(est).min(u64::MAX as u128) as u64)
     }
 
     /// Sign and submit. Returns the transaction hash; the caller waits for it.

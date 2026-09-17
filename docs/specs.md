@@ -747,7 +747,9 @@ transaction this EOA can sign, and RAILGUN shields WETH like any other ERC-20
 
 So `plan` (pure, and unit-tested without a chain) decides in this order:
 
-1. no gas → ask, whatever else is held: nothing can be signed without it;
+1. not enough ETH for the whole run → ask, whatever else is held: the last
+   leg's reservation is due whatever is shielded, so this is `price_run` with
+   nothing wrapped and not merely "no gas";
 2. enough of the preferred ERC-20 (`asset`, default Sepolia USDC) → shield that,
    wrap nothing — so a USDC balance an operator did send is never stranded;
 3. a **named** `asset` that is short → ask, naming it: `deposit()` exists on the
@@ -1305,8 +1307,9 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   blocks were not local, and it is **one operator transfer**: Sepolia ETH to
   `0x23cc2752F664Bf465A3631253687712b222B1722` (the probe mints its own ERC-20
   out of it), in the amount the run's own `needsFunding` prints — ≈ 0.0070 ETH at
-  a 1 gwei base fee, and 0.02 is comfortable at any fee this chain has shown. No agent at this venue can obtain testnet funds, and the
-  venue's own funded account cannot sign for one — keystore signing is a human
+  a 1 gwei base fee, and 0.02 is comfortable at any fee this chain has shown. No
+  agent at this venue can obtain testnet funds, and the venue's own funded
+  account cannot sign for one — keystore signing is a human
   `approve(handle, bundle_id, password)` and the vault password is not an
   agent's to have. Until then an unfunded run **surveys** the public chain
   instead of stopping: engine, a sync of the real accumulator to the live tip,

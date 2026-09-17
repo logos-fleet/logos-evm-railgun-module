@@ -245,11 +245,11 @@ pub trait RailgunModule: 'static {
     /// ACCEPTED BY THE CONTRACT.
     /// `{ "asset"?, "shield"?, "transfer"?, "memo"?, "broadcast"?, "confirmMs"? }`
     /// → `{ ok, chainId, node, forked, witnessBackend, eoa, ethWei, feeWeiPerGas,
-    /// tokenUnits,
-    /// needsFunding?, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx,
-    /// shieldBlock, syncFromBlock, syncToBlock, balance, transferred, circuit,
-    /// rootOnChain, syncedTree, syncedRoot, syncedRootOnChain, calldataBytes,
-    /// transferTx, transferBlock, totalMs, legs: [{ name, ms, ok, error? }] }`.
+    /// tokenUnits, needsFunding?, asset, wrappedWei, wrapTx, from, to, approveTx,
+    /// shieldTx, shieldBlock, syncFromBlock, syncToBlock, balance, transferred,
+    /// circuit, rootOnChain, syncedTree, syncedRoot, syncedRootOnChain,
+    /// calldataBytes, transferTx, transferBlock, totalMs,
+    /// legs: [{ name, ms, ok, error? }] }`.
     ///
     /// `node` / `forked` say WHOSE chain answered, because a fork of Sepolia
     /// prints byte-identical lines to the public chain. `witnessBackend` is the
