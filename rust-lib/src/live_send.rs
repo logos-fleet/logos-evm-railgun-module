@@ -828,8 +828,10 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             return out.finished(started);
         }
     };
-    let mut plan =
-        SyncPlan::new(sync::synced_block(db.as_ref(), Some(&from.to_string())).await, head);
+    // The account whose record says how far the sync has got -- this probe's own
+    // `0zk`, the one `sync::synced_block` takes the minimum against.
+    let zk_address = from.to_string();
+    let mut plan = SyncPlan::new(sync::synced_block(db.as_ref(), Some(&zk_address)).await, head);
     // The subsquid half in one window -- see `sync::subsquid_frontier`.
     if let Some(frontier) = sync::subsquid_frontier(&chain).await {
         plan = plan.with_fast_forward(frontier);
@@ -843,7 +845,7 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             out.legs.push(Leg::failed("sync", Some(t.elapsed().as_millis()), format!("sync: {e}")));
             return out.finished(started);
         }
-        plan.record(sync::synced_block(db.as_ref(), Some(&from.to_string())).await, ms);
+        plan.record(sync::synced_block(db.as_ref(), Some(&zk_address)).await, ms);
         sync::report(&plan);
         if plan.synced_block <= before {
             // The engine will not pass this block, so neither will another turn
@@ -1040,7 +1042,7 @@ pub fn summary(r: &Run) -> String {
         leg("approve"),
         leg("shield"),
         leg("sync"),
-        r.sync_to_block.zip(r.sync_from_block).map(|(to, from)| to.saturating_sub(from)),
+        r.sync_from_block.zip(r.sync_to_block).map(|(from, to)| to.saturating_sub(from)),
         leg("balance"),
         leg("transfer"),
         leg("broadcast"),

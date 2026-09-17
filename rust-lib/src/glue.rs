@@ -303,7 +303,7 @@ struct RailgunModuleImpl {
     engine: Option<RailgunEngine>,
     /// The stepped sync in progress, if any — see [`RailgunModule::sync_step`].
     /// `None` between syncs, which is also what a cancel leaves behind.
-    sync_plan: Option<sync::Plan>,
+    sync_plan: Option<Plan>,
     /// Relayed sends awaiting a human, keyed by the keystore approval handle
     /// (the `requestId` the caller polls).
     jobs: HashMap<String, PendingRelay>,
@@ -360,6 +360,19 @@ const DEFAULT_STEP_BUDGET_MS: u64 = 20_000;
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
+}
+
+/// A PROGRESS REPLY: the plan's own fields ([`Plan::to_json`]) with this call's
+/// `verdict` object merged over them. `sync_step`, `sync_status` and
+/// `sync_cancel` all answer the same shape, so there is one place it is built.
+fn plan_reply(plan: &Plan, verdict: Value) -> String {
+    let mut out = plan.to_json();
+    if let Some(fields) = verdict.as_object() {
+        for (field, value) in fields {
+            out[field] = value.clone();
+        }
+    }
+    out.to_string()
 }
 
 /// A probe's `params_json`, where every field is optional. A `--call` with no
@@ -577,11 +590,8 @@ impl RailgunModule for RailgunModuleImpl {
                 let before = plan.synced_block;
                 let (result, ms) = sync::timed(engine.sync_to(end)).await;
                 if let Err(e) = result {
-                    let mut out = plan.to_json();
-                    out["ok"] = json!(false);
-                    out["error"] = json!(e);
-                    out["stepMs"] = json!(step.elapsed().as_millis());
-                    return out.to_string();
+                    let step_ms = step.elapsed().as_millis();
+                    return plan_reply(plan, json!({ "ok": false, "error": e, "stepMs": step_ms }));
                 }
                 // WHAT THE ENGINE REACHED, read back from its own record rather
                 // than assumed to be the window end: the indexer clamps to its
@@ -593,30 +603,22 @@ impl RailgunModule for RailgunModuleImpl {
                     // Nothing moved. Report it rather than looping on it — an
                     // engine that cannot pass this block will not pass it on the
                     // next turn either, and a spin is worse than a stall.
-                    let mut out = plan.to_json();
-                    out["ok"] = json!(true);
-                    out["stalled"] = json!(true);
-                    out["stepMs"] = json!(step.elapsed().as_millis());
-                    return out.to_string();
+                    let step_ms = step.elapsed().as_millis();
+                    return plan_reply(plan, json!({ "ok": true, "stalled": true, "stepMs": step_ms }));
                 }
                 if step.elapsed().as_millis() >= budget_ms {
                     break;
                 }
             }
 
-            let mut out = plan.to_json();
-            out["ok"] = json!(true);
-            out["stepMs"] = json!(step.elapsed().as_millis());
-            out.to_string()
+            let step_ms = step.elapsed().as_millis();
+            plan_reply(plan, json!({ "ok": true, "stepMs": step_ms }))
         })
     }
 
     fn sync_status(&mut self) -> String {
         if let Some(plan) = self.sync_plan.as_ref() {
-            let mut out = plan.to_json();
-            out["ok"] = json!(true);
-            out["running"] = json!(true);
-            return out.to_string();
+            return plan_reply(plan, json!({ "ok": true, "running": true }));
         }
         let Some(engine) = self.engine.as_mut() else {
             return err("railgun_module not initialized (call init first)");
@@ -628,25 +630,19 @@ impl RailgunModule for RailgunModuleImpl {
                 Err(e) => return err(e),
             };
             // A plan that was never started, so the caller sees the same shape
-            // and the same fields whether one is running or not.
-            let mut out = Plan::new(synced, target).to_json();
-            out["ok"] = json!(true);
-            out["running"] = json!(false);
-            // No frontier query here: `sync_status` costs one `eth_blockNumber`
-            // and nothing else, which is what makes it safe to ask often.
-            out.to_string()
+            // and the same fields whether one is running or not. No frontier
+            // query here: `sync_status` costs one `eth_blockNumber` and nothing
+            // else, which is what makes it safe to ask often.
+            plan_reply(&Plan::new(synced, target), json!({ "ok": true, "running": false }))
         })
     }
 
     fn sync_cancel(&mut self) -> String {
         match self.sync_plan.take() {
-            Some(plan) => {
-                let mut out = plan.to_json();
-                out["ok"] = json!(true);
-                out["cancelled"] = json!(true);
-                out["keptToBlock"] = json!(plan.synced_block);
-                out.to_string()
-            }
+            Some(plan) => plan_reply(
+                &plan,
+                json!({ "ok": true, "cancelled": true, "keptToBlock": plan.synced_block }),
+            ),
             None => json!({ "ok": true, "cancelled": false }).to_string(),
         }
     }
