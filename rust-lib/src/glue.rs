@@ -50,6 +50,7 @@ use crate::private_send;
 use crate::proof_circuit;
 use crate::relay;
 use crate::rpc_backend::{EthRpcEip1193, RpcBackend};
+use crate::sync::{self, Plan};
 use crate::web_dependency::{self, Dependency, Leg};
 use crate::witness_circuit;
 use crate::witness_engine;
@@ -67,7 +68,61 @@ pub trait RailgunModule: 'static {
     /// The public `0zk1…` RAILGUN address (`{ ok, address }`).
     fn get_zk_address(&mut self) -> String;
     /// Sync UTXO/TXID (and POI, if enabled) state to the latest block.
+    ///
+    /// ONE CALL, AS LONG AS IT TAKES — 221 s on a physical iPad Air 4 (#235),
+    /// with nothing to report and nothing to interrupt. Use it where there is
+    /// no user: [`Self::sync_step`] is the same work, in bounded pieces.
     fn sync(&mut self) -> String;
+    /// ADVANCE THE SYNC, A BOUNDED PIECE AT A TIME, AND SAY WHERE IT GOT TO.
+    /// `{ "blocks"?: u64, "budgetMs"?: u64 }` →
+    /// `{ ok, done, startBlock, syncedBlock, targetBlock, blocksTotal,
+    /// blocksDone, blocksRemaining, percent, windows, elapsedMs, etaMs,
+    /// stepMs }`.
+    ///
+    /// The accumulator sync is the whole cost of a private send — 221 s of the
+    /// 239 s one took on a handset, against 3.6 s for witness + Groth16 +
+    /// verify — and [`Self::sync`] does it in one opaque call that cannot be
+    /// shown, cannot be interrupted and outlasts any caller's timeout. This
+    /// does the same work in windows: each call syncs at most `blocks`
+    /// (default 25 000) and returns after `budgetMs` (default 20 000) whether
+    /// or not it finished, so **no call takes minutes** and the caller has a
+    /// real percentage and an ETA between them rather than a spinner.
+    ///
+    /// **Call it until `done` is true.** The target is pinned when the first
+    /// step makes the plan, so the percentage cannot go backwards as the chain
+    /// advances; a send needs the tree to hold its own shield, and the blocks
+    /// after that are the next sync's business.
+    ///
+    /// **THE CANCEL PATH IS: STOP CALLING IT.** There is nothing to roll back.
+    /// A sync only reads the chain, `UtxoIndexer::sync_to` persists
+    /// `synced_block` before each window returns, and a later step (or a later
+    /// launch — the record is on disk) resumes from there. A **shield that is
+    /// already mined is untouched**: it is on chain, the note is owned by this
+    /// wallet's `0zk` address, and the next sync of any length finds and
+    /// decrypts it. Cancelling after the shield leaves a shielded balance and
+    /// no transfer, which is a state the wallet can show and spend from.
+    /// [`Self::sync_cancel`] exists to say so in one call and to drop the
+    /// pinned target; it is not an undo.
+    fn sync_step(&mut self, params_json: String) -> String;
+    /// WHERE THE SYNC IS, without doing any of it.
+    /// `{ ok, running, done, startBlock, syncedBlock, targetBlock, percent, … }`
+    /// — the same fields [`Self::sync_step`] answers with.
+    ///
+    /// With a plan in progress it reports that plan. With none it reads the
+    /// engine's persisted `synced_block` and asks the chain for its head, which
+    /// is what a wallet wants before it offers to send: "this device is 2 200
+    /// blocks behind" is the difference between a send that is instant and one
+    /// that is not. Costs one `eth_blockNumber` and no chain walk.
+    fn sync_status(&mut self) -> String;
+    /// GIVE UP ON THE SYNC IN PROGRESS. `{ ok, cancelled, keptToBlock, … }`.
+    ///
+    /// Drops the pinned target so the next [`Self::sync_step`] makes a fresh
+    /// plan against the current head. **It undoes nothing**, because there is
+    /// nothing a sync did that should be undone: every window that completed is
+    /// persisted and correct, and a mined shield is the chain's, not this
+    /// module's. `keptToBlock` is how far the cancelled sync had got, and a
+    /// later step starts there.
+    fn sync_cancel(&mut self) -> String;
     /// Shielded balance per asset (`{ ok, balances: [BalanceEntry] }`).
     fn get_shielded_balance(&mut self) -> String;
     /// SHIELD (deposit public → private): `{ "asset": "0x…", "amount": "decimal" }`
@@ -246,6 +301,9 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 struct RailgunModuleImpl {
     persist_dir: Option<PathBuf>,
     engine: Option<RailgunEngine>,
+    /// The stepped sync in progress, if any — see [`RailgunModule::sync_step`].
+    /// `None` between syncs, which is also what a cancel leaves behind.
+    sync_plan: Option<sync::Plan>,
     /// Relayed sends awaiting a human, keyed by the keystore approval handle
     /// (the `requestId` the caller polls).
     jobs: HashMap<String, PendingRelay>,
@@ -291,6 +349,14 @@ impl RpcBackend for EthRpcBackend {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// How long one [`RailgunModule::sync_step`] keeps going before it reports,
+/// when the caller names no budget.
+///
+/// 20 s: comfortably inside every default call timeout this module is reached
+/// through (`ShellCallDriver` waits 60 s, `logoscore` 30 s), and long enough
+/// that a caller driving a two-minute sync makes six calls rather than sixty.
+const DEFAULT_STEP_BUDGET_MS: u64 = 20_000;
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
@@ -459,6 +525,119 @@ impl RailgunModule for RailgunModuleImpl {
                 Err(e) => err(e),
             },
             None => err("railgun_module not initialized (call init first)"),
+        }
+    }
+
+    fn sync_step(&mut self, params_json: String) -> String {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(rename_all = "camelCase", default)]
+        struct StepParams {
+            blocks: Option<u64>,
+            budget_ms: Option<u64>,
+        }
+
+        let p: StepParams = match optional_params(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(format!("bad params: {e}")),
+        };
+        let window = p.blocks.unwrap_or(sync::DEFAULT_WINDOW_BLOCKS);
+        let budget_ms = u128::from(p.budget_ms.unwrap_or(DEFAULT_STEP_BUDGET_MS));
+
+        // Both fields of `self`, taken apart so the plan can be held across the
+        // engine's awaits.
+        let Some(engine) = self.engine.as_mut() else {
+            return err("railgun_module not initialized (call init first)");
+        };
+        let slot = &mut self.sync_plan;
+
+        block_on(async move {
+            if slot.is_none() {
+                let synced = engine.synced_block().await;
+                let target = match engine.latest_block().await {
+                    Ok(t) => t,
+                    Err(e) => return err(e),
+                };
+                *slot = Some(Plan::new(synced, target));
+            }
+            let plan = slot.as_mut().expect("just filled");
+
+            let step = Instant::now();
+            // AS MANY WINDOWS AS THE BUDGET BUYS, and at least one: a step that
+            // returned having done nothing would make a caller's loop spin.
+            loop {
+                let Some(end) = plan.next_window_end(window) else { break };
+                let before = plan.synced_block;
+                let (result, ms) = sync::timed(engine.sync_to(end)).await;
+                if let Err(e) = result {
+                    let mut out = plan.to_json();
+                    out["ok"] = json!(false);
+                    out["error"] = json!(e);
+                    out["stepMs"] = json!(step.elapsed().as_millis());
+                    return out.to_string();
+                }
+                // WHAT THE ENGINE REACHED, read back from its own record rather
+                // than assumed to be the window end: the indexer clamps to its
+                // syncer's latest block, so a chain that has not produced the
+                // blocks we asked for gives less than we asked for.
+                plan.record(engine.synced_block().await, ms);
+                sync::report(plan);
+                if plan.synced_block <= before {
+                    // Nothing moved. Report it rather than looping on it — an
+                    // engine that cannot pass this block will not pass it on the
+                    // next turn either, and a spin is worse than a stall.
+                    let mut out = plan.to_json();
+                    out["ok"] = json!(true);
+                    out["stalled"] = json!(true);
+                    out["stepMs"] = json!(step.elapsed().as_millis());
+                    return out.to_string();
+                }
+                if step.elapsed().as_millis() >= budget_ms {
+                    break;
+                }
+            }
+
+            let mut out = plan.to_json();
+            out["ok"] = json!(true);
+            out["stepMs"] = json!(step.elapsed().as_millis());
+            out.to_string()
+        })
+    }
+
+    fn sync_status(&mut self) -> String {
+        if let Some(plan) = self.sync_plan.as_ref() {
+            let mut out = plan.to_json();
+            out["ok"] = json!(true);
+            out["running"] = json!(true);
+            return out.to_string();
+        }
+        let Some(engine) = self.engine.as_mut() else {
+            return err("railgun_module not initialized (call init first)");
+        };
+        block_on(async {
+            let synced = engine.synced_block().await;
+            let target = match engine.latest_block().await {
+                Ok(t) => t,
+                Err(e) => return err(e),
+            };
+            // A plan that was never started, so the caller sees the same shape
+            // and the same fields whether one is running or not.
+            let mut out = Plan::new(synced, target).to_json();
+            out["ok"] = json!(true);
+            out["running"] = json!(false);
+            out.to_string()
+        })
+    }
+
+    fn sync_cancel(&mut self) -> String {
+        match self.sync_plan.take() {
+            Some(plan) => {
+                let mut out = plan.to_json();
+                out["ok"] = json!(true);
+                out["cancelled"] = json!(true);
+                out["keptToBlock"] = json!(plan.synced_block);
+                out.to_string()
+            }
+            None => json!({ "ok": true, "cancelled": false }).to_string(),
         }
     }
 

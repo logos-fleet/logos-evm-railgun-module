@@ -27,6 +27,7 @@ use userop_kit::smart_account::simple_smart_account::SimpleSmartAccount;
 use crate::db_adapter::DiskDatabase;
 use crate::keys;
 use crate::rpc_backend::{EthRpcEip1193, RpcBackend};
+use crate::sync::{self, Tuning};
 
 /// A loaded, key-registered RAILGUN engine for one chain.
 pub struct RailgunEngine {
@@ -39,6 +40,11 @@ pub struct RailgunEngine {
     chain_id: u64,
     /// The only fee token `prepare_userop` accepts (the chain's wrapped base token).
     wrapped_base_token: Address,
+    /// The engine's own store, kept so this wrapper can read the `synced_block`
+    /// the indexer persists into it -- see [`crate::sync::synced_block`]. The
+    /// engine exposes no getter for it and a stepped sync needs to know where it
+    /// is starting from.
+    db: Arc<dyn railgun::database::Database>,
 }
 
 /// Parse a `0x…`/bare ERC-20 token address into an `AssetId`.
@@ -69,9 +75,16 @@ impl RailgunEngine {
 
         // One adapter, shared by the engine builder and the 4337 smart account.
         let eip1193: Arc<dyn Eip1193Provider> = Arc::new(EthRpcEip1193::new(backend));
-        let db = Arc::new(DiskDatabase::new(data_dir)?);
+        let db: Arc<dyn railgun::database::Database> = Arc::new(DiskDatabase::new(data_dir)?);
 
-        let mut builder = RailgunBuilder::new(chain, eip1193.clone()).with_database(db);
+        // THE SYNCER IS THIS MODULE'S, and it is the engine's own default with
+        // two numbers changed. `RpcSyncer`'s defaults walk the chain ten blocks
+        // at a time with a one-second sleep after each, which is 100 ms per
+        // block and was 221 of the 239 seconds a private send took on a handset
+        // (#235). See [`crate::sync`].
+        let mut builder = RailgunBuilder::new(chain.clone(), eip1193.clone())
+            .with_database(db.clone())
+            .with_utxo_syncer(sync::utxo_syncer(&chain, eip1193.clone(), &Tuning::default()));
         if poi {
             builder = builder.with_poi();
         }
@@ -81,7 +94,7 @@ impl RailgunEngine {
             .await
             .map_err(|e| format!("register signer: {e}"))?;
 
-        Ok(Self { provider, address, signer, eip1193, chain_id, wrapped_base_token })
+        Ok(Self { provider, address, signer, eip1193, chain_id, wrapped_base_token, db })
     }
 
     /// Build the engine deriving its railgun keys from an opaque `seed` (a
@@ -105,8 +118,31 @@ impl RailgunEngine {
     }
 
     /// Sync UTXO/TXID (and POI, if enabled) state to the latest block.
+    ///
+    /// ONE CALL, however long it takes — which on a handset was 221 s and is
+    /// why [`Self::sync_to`] and the stepped surface above it exist. Kept
+    /// because a caller that has no user to report to (a test, a headless run)
+    /// should not have to write a loop.
     pub async fn sync(&mut self) -> Result<(), String> {
         self.provider.sync().await.map_err(|e| format!("sync: {e}"))
+    }
+
+    /// Sync no further than `to_block`. The bounded step a progress surface is
+    /// built out of: `UtxoIndexer::sync_to` persists `synced_block` before it
+    /// returns, so a window that completed is kept whether or not the next one
+    /// is ever asked for.
+    pub async fn sync_to(&mut self, to_block: u64) -> Result<(), String> {
+        self.provider.sync_to(to_block).await.map_err(|e| format!("sync: {e}"))
+    }
+
+    /// How far the engine has synced, read out of its own store.
+    pub async fn synced_block(&self) -> u64 {
+        sync::synced_block(self.db.as_ref(), Some(&self.zk_address())).await
+    }
+
+    /// The chain's current head — where a sync started now would be going.
+    pub async fn latest_block(&self) -> Result<u64, String> {
+        self.eip1193.get_block_number().await.map_err(|e| format!("eth_blockNumber: {e}"))
     }
 
     /// Shielded balance per asset, as the engine's `BalanceEntry` JSON array.

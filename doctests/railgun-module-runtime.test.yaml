@@ -166,6 +166,9 @@ sections:
           - "init"
           - "get_zk_address"
           - "prepare_shield"
+          # The stepped sync surface (#235) -- a private send's 221 s is the
+          # accumulator sync, and this is the API a caller drives it with.
+          - "sync_step"
       - title: "Build the engine on Sepolia (offline)"
         text: |
           `init` builds and registers the railgun engine for Sepolia and returns

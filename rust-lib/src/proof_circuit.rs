@@ -26,8 +26,16 @@
 //! lead you to budget for, and not the dominant cost either. The whole compute
 //! half (witness + proof + verify) is about 1.3 s on an A14; what a FIRST
 //! private send waits for is 3.5 MB of artifact (≈3.2 s cold, ≈1.6 s warm),
-//! which is cacheable and is the network's number. A private send on iOS needs
-//! neither a background job nor a cancel path.
+//! which is cacheable and is the network's number.
+//!
+//! **AND THAT WAS THE WRONG CONCLUSION ABOUT THE WHOLE SEND (#235).** This
+//! module measured the PARTS; the whole was measured in #213 and it is 239 s on
+//! the same iPad, of which 221 s is the accumulator sync and 3.6 s is everything
+//! here. A private send did need a progress surface and a cancel path — for the
+//! SYNC, never for the proof — and the sync needed the fix it got in
+//! [`crate::sync`]. The sentence that used to end this paragraph ("a private
+//! send on iOS needs neither a background job nor a cancel path") was true of
+//! the numbers on this page and false of the operation.
 //!
 //! And the line above it is the one this module was written for: it is printed
 //! from inside the ENGINE's own `calculate_witness`, by the branch #188's patch
