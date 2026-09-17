@@ -70,6 +70,15 @@
 //! which is a complete handoff rather than a failure: the address is fixed, so
 //! the funding is a one-time step and every later run is unattended.
 //!
+//! HOW MUCH is [`price_run`], read off the chain, rather than a constant. What
+//! decides a run is not what its four transactions spend but what EIP-1559 makes
+//! the LAST of them reserve, and that one is reached only after the shield has
+//! been mined -- so an ask that is merely bigger than the gas bill strands a
+//! note in the contract's tree. That is not a hypothesis: it is reproduced on a
+//! fork in `docs/specs.md`, with the shield mined and the broadcast refused for
+//! funds. [`can_still_transact`] asks the same question again immediately before
+//! the shield, which is the last leg at which refusing costs nothing.
+//!
 //! ## And every leg can be RUN today, against a fork, with no operator at all
 //!
 //! `anvil --fork-url <sepolia>` serves the real Sepolia state — the same
@@ -150,9 +159,127 @@ pub const DEFAULT_SHIELD: u128 = 100_000;
 /// `01x02` circuit the other two probes measured.
 pub const DEFAULT_WRAP_SHIELD: u128 = 100_000_000_000_000;
 
-/// Gas the probe wants to see before it starts spending: a shield is ~250 k gas
-/// and a `transact` ~1.5 M, so at Sepolia's usual few gwei this is generous.
+/// THE FLOOR under the operator ask, and nothing more than a floor: what a run
+/// actually needs is [`price_run`], read off the chain it is pointed at. Kept
+/// because a node that will not quote a fee still has to be asked for
+/// something, and because every earlier #213 cycle's ask was this number.
 pub const MIN_GAS_WEI: u128 = 5_000_000_000_000_000; // 0.005 ETH
+
+// ── WHAT ONE WHOLE SEND COSTS, MEASURED ──────────────────────────────────────
+//
+// Not estimates: every figure below is a receipt this probe's own end-to-end
+// runs produced, and they are in `docs/specs.md` with their block numbers. The
+// estimate they replace was out by a factor of three on the leg that matters
+// most (`MIN_GAS_WEI`'s own comment said "a shield is ~250 k gas").
+
+/// `deposit()` on the wrapped base token -- `eth_estimateGas` against public
+/// Sepolia, #213 cycle 4.
+pub const GAS_WRAP: u128 = 45_418;
+/// `approve(RailgunSmartWallet, …)` -- an ERC-20 allowance write.
+pub const GAS_APPROVE: u128 = 46_000;
+/// The engine's own `ShieldBuilder` calldata, MINED: 731 335 gas, block
+/// 11 720 023 (#213 cycle 6, physical iPad).
+pub const GAS_SHIELD: u128 = 731_335;
+/// The proved `transact(...)`, MINED: 1 008 274 gas, block 11 720 024. The
+/// largest single reservation a run makes, and the last one it makes.
+pub const GAS_TRANSACT: u128 = 1_008_274;
+
+/// [`Eoa::send`] sets `max_fee_per_gas` to twice the chain's own `eth_gasPrice`
+/// -- plus a priority tip, which this leaves out. A node reserves against that
+/// ceiling, not against the fee the transaction will actually pay.
+///
+/// Leaving the tip out is covered at the `funding` leg, where
+/// [`FEE_DRIFT_MULTIPLE`] makes the ask hold 4x the quoted price per unit of
+/// limit against a ceiling of 2x plus the tip. [`can_still_transact`] has no
+/// such margin and so under-states each reservation by the tip over the limit.
+const MAX_FEE_MULTIPLE: u128 = 2;
+
+/// AND THE BASE FEE MOVES WHILE A RUN IS IN FLIGHT. Four transactions and a
+/// sync are minutes apart on the public chain, and Sepolia's base fee routinely
+/// doubles inside that window. An ask that is exactly right at the moment it is
+/// printed is wrong by the time it is funded.
+const FEE_DRIFT_MULTIPLE: u128 = 2;
+
+/// The 30 % [`Eoa::gas_limit`] puts over an `eth_estimateGas`, written once so
+/// the pricing and the sending cannot drift apart. The limit is what a node
+/// checks a balance against, not the estimate under it.
+fn with_headroom(gas: u128) -> u128 {
+    gas.saturating_mul(13) / 10
+}
+
+/// WHAT A NODE MAKES AN ACCOUNT HOLD to accept one transaction: it refuses
+/// `eth_sendRawTransaction` unless the balance covers
+/// `gas_limit * max_fee_per_gas + value`, and both factors are larger than what
+/// the transaction goes on to use -- see [`with_headroom`] and
+/// [`MAX_FEE_MULTIPLE`]. The `value` is the caller's to add.
+fn reservation(fee_wei_per_gas: u128, gas: u128) -> u128 {
+    fee_wei_per_gas.saturating_mul(MAX_FEE_MULTIPLE).saturating_mul(with_headroom(gas))
+}
+
+/// WHAT THE PROBE'S EOA MUST HOLD FOR ONE WHOLE SEND, at a fee the chain has
+/// just quoted -- the operator ask, as arithmetic rather than as a constant.
+///
+/// The binding constraint is not what the four transactions SPEND. It is what
+/// the LAST of them RESERVES: a node refuses `eth_sendRawTransaction` unless the
+/// account covers `gas_limit * max_fee_per_gas + value` at submission, and the
+/// proved `transact(...)` is both the biggest of the four and the one reached
+/// only after the shield has been mined. Fail there and the shield is already
+/// in the contract's tree, worth exactly as much as the gas to move it -- which
+/// is what the account no longer has.
+///
+/// So the ask is: what the wrap moves out, plus what the three legs before the
+/// transact pay, plus what the transact has to be holding when it is signed --
+/// all of it at a fee allowed to drift ([`FEE_DRIFT_MULTIPLE`]), and never less
+/// than [`MIN_GAS_WEI`] plus the wrap.
+pub fn price_run(fee_wei_per_gas: u128, wrap: u128) -> u128 {
+    let drifted = fee_wei_per_gas.saturating_mul(FEE_DRIFT_MULTIPLE);
+    let spent = drifted.saturating_mul(GAS_WRAP + GAS_APPROVE + GAS_SHIELD);
+    let held_back = reservation(drifted, GAS_TRANSACT);
+    wrap.saturating_add(spent)
+        .saturating_add(held_back)
+        .max(MIN_GAS_WEI.saturating_add(wrap))
+}
+
+/// CAN THIS PURSE STILL PAY FOR THE `transact` AFTER THE SHIELD?
+///
+/// Asked immediately before the shield is broadcast, which is the last moment at
+/// which nothing has been staked. [`price_run`] answers the same question at the
+/// `funding` leg, but the two are minutes apart and the fee between them is the
+/// chain's business, not this probe's -- so the question is asked twice and the
+/// second answer is the one that decides.
+///
+/// Refusing here costs the gas of the wrap and the approve. Refusing one leg
+/// later costs a shielded balance as well, and that is the expensive half of
+/// #213 clause 1: a shield has to be re-mined and re-synced, the funds cannot.
+pub fn can_still_transact(wei: u128, fee_wei_per_gas: u128) -> Result<(), String> {
+    // Every refusal says the same two things -- what it is protecting and what
+    // to do about it -- so only the reason in the middle is written twice.
+    let refuse = |why: String| -> Result<(), String> {
+        Err(format!(
+            "stopping BEFORE the shield: {why} Top {} up and run again -- nothing has been \
+             shielded, so nothing is stranded.",
+            probe_eoa_address()
+        ))
+    };
+    let shield_reservation = reservation(fee_wei_per_gas, GAS_SHIELD);
+    if wei < shield_reservation {
+        return refuse(format!(
+            "at the chain's current {fee_wei_per_gas} wei/gas the shield alone reserves \
+             {shield_reservation} wei and this EOA holds {wei}."
+        ));
+    }
+    let after = wei.saturating_sub(fee_wei_per_gas.saturating_mul(GAS_SHIELD));
+    let transact_reservation = reservation(fee_wei_per_gas, GAS_TRANSACT);
+    if after < transact_reservation {
+        return refuse(format!(
+            "it would leave {after} wei and the proved transact(...) reserves \
+             {transact_reservation} at the chain's current {fee_wei_per_gas} wei/gas. \
+             Shielding now would put a note in the contract's tree that this EOA could not \
+             then spend."
+        ));
+    }
+    Ok(())
+}
 
 /// Client versions that mean "a chain running on this desk". A fork answers
 /// every question Sepolia answers — same chain id, same contract bytecode, same
@@ -227,6 +354,11 @@ pub struct Run {
     /// chain id, the contracts, the tree and `rootOnChain`, so this is the only
     /// field that tells the two apart. `None` where the node would not say.
     pub node: Option<String>,
+    /// WHAT GAS COST WHEN THE `funding` LEG PRICED THIS RUN (`eth_gasPrice`).
+    /// The ask is arithmetic over this number, so reporting it is what lets a
+    /// reader tell a stale ask from a wrong one. `None` where the node would
+    /// not quote a price.
+    pub fee_wei_per_gas: Option<u128>,
     /// The node named itself a local development chain, so this run is against
     /// a FORK and not the public chain — see [`is_local_fork`].
     pub forked: bool,
@@ -362,6 +494,12 @@ pub struct Purse {
     /// named an asset: then there is nothing to mint and a short balance is an
     /// ask.
     pub wrapped: Option<Holding>,
+    /// WHAT THE CHAIN SAYS GAS COSTS RIGHT NOW (`eth_gasPrice`), which is what
+    /// turns the ask from a constant into a price ([`price_run`]). `None` where
+    /// the node would not quote one: the ask then falls back to
+    /// [`MIN_GAS_WEI`], which is what every #213 cycle before this one asked
+    /// for. Evidence, like `node` -- never a reason to stop.
+    pub fee_wei_per_gas: Option<u128>,
 }
 
 /// What the probe will shield. `wrap` is the wei of the EOA's own ETH to turn
@@ -384,7 +522,8 @@ pub struct Plan {
 ///
 /// Pure, and ordered so the answer is never surprising:
 ///
-/// 1. no gas -> ask, whatever else is held (nothing can be signed without it);
+/// 1. not enough ETH for the whole run -> ask, whatever else is held (see
+///    `gas_only` below: the last leg's reservation is due whatever is shielded);
 /// 2. enough of the preferred ERC-20 -> shield that, wrap nothing;
 /// 3. a named asset that is short -> ask, naming it (nothing to mint);
 /// 4. enough of the wrapped base token already -> shield that, wrap nothing;
@@ -400,7 +539,16 @@ pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
     // gas, plus whatever the wrapped balance is short of a shield. Zero when
     // there is nothing to mint, which is what a named `asset` means.
     let shortfall = purse.wrapped.map_or(0, |w| want_wrapped.saturating_sub(w.units));
-    let full_ask = MIN_GAS_WEI.saturating_add(shortfall);
+    // What the whole run costs at the fee the chain just quoted -- and the old
+    // constant where it would not quote one.
+    let priced = |wrap: u128| match purse.fee_wei_per_gas {
+        Some(fee) => price_run(fee, wrap),
+        None => MIN_GAS_WEI.saturating_add(wrap),
+    };
+    let full_ask = priced(shortfall);
+    // The floor a run must clear even when it wraps nothing: the transact's
+    // reservation does not get smaller because the ERC-20 was already there.
+    let gas_only = priced(0);
 
     let ask = || {
         let (held, mint) = match purse.wrapped {
@@ -426,15 +574,28 @@ pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
             ),
         };
         format!(
-            "fund {} on Sepolia with at least {full_ask} wei of ETH: it holds {} wei and \
+            "fund {} on Sepolia with at least {full_ask} wei of ETH{}: it holds {} wei and \
              {held}.{mint} That address is FIXED (it is derived from a seed in \
              rust-lib/src/live_send.rs), so this is a one-time step -- every run after it is \
              unattended.",
-            purse.eoa, purse.wei
+            purse.eoa,
+            // WHY THAT NUMBER. An ask nobody can check is an ask nobody can see
+            // has gone stale, and the fee it was priced at is the thing that
+            // moves -- see `price_run`.
+            match purse.fee_wei_per_gas {
+                Some(fee) => format!(
+                    " (priced at the chain's own {fee} wei/gas for {} gas of shield and \
+                     transact, with room for the fee to move)",
+                    GAS_WRAP + GAS_APPROVE + GAS_SHIELD + GAS_TRANSACT
+                ),
+                None => " (this node would not quote a gas price, so this is the floor)"
+                    .to_string(),
+            },
+            purse.wei
         )
     };
 
-    if purse.wei < MIN_GAS_WEI {
+    if purse.wei < gas_only {
         return Err(ask());
     }
     if purse.erc20.units >= want_erc20 {
@@ -450,6 +611,34 @@ pub fn plan(purse: &Purse, asked: Option<u128>) -> Result<Plan, String> {
         return Ok(Plan { token: wrapped.token, shield: want_wrapped, wrap: Some(shortfall) });
     }
     Err(ask())
+}
+
+/// WHAT THE LAST FREE QUESTION LEARNED: the fee, the balance and the verdict.
+///
+/// A struct rather than a `Result` because two of the three are worth reporting
+/// whatever the answer was -- an ask that names neither the fee nor the balance
+/// cannot be told from a wrong one.
+#[derive(Debug, Clone, Default)]
+pub struct ShieldGate {
+    pub fee_wei_per_gas: Option<u128>,
+    pub wei: Option<u128>,
+    /// Why the shield must not go out. `None` also when the node would not
+    /// answer: unreadable is not a refusal, exactly as it is not at the
+    /// `funding` leg, because the price is EVIDENCE and the send is the
+    /// measurement.
+    pub refusal: Option<String>,
+}
+
+/// Ask it. Split out of [`run`] so a test can put a chain in front of it: the
+/// call site is past the engine build, which no unit test can reach.
+fn shield_gate<B: RpcBackend>(eoa: &Eoa<B>) -> ShieldGate {
+    let fee_wei_per_gas = eoa.gas_price();
+    let wei = eoa.eth_balance().ok();
+    let refusal = match (fee_wei_per_gas, wei) {
+        (Some(fee), Some(wei)) => can_still_transact(wei, fee).err(),
+        _ => None,
+    };
+    ShieldGate { fee_wei_per_gas, wei, refusal }
 }
 
 /// Announce a stage BEFORE entering it: on a platform that kills the process
@@ -491,6 +680,13 @@ impl<B: RpcBackend> Eoa<B> {
         quantity(&self.rpc("eth_getBalance", json!([self.address.to_string(), "latest"]))?)
     }
 
+    /// What the chain says gas costs. The same call [`Eoa::send`] prices every
+    /// transaction from, asked here so the FUNDING decision is made on it too
+    /// rather than on a constant -- see [`price_run`].
+    fn gas_price(&self) -> Option<u128> {
+        self.rpc("eth_gasPrice", json!([])).ok().and_then(|v| quantity(&v).ok())
+    }
+
     /// `eth_estimateGas` with 30 % of headroom. A revert here is the honest place
     /// to learn that a transaction would fail, so the error is propagated rather
     /// than replaced with a fixed limit that would burn the gas to find out.
@@ -502,7 +698,7 @@ impl<B: RpcBackend> Eoa<B> {
             "data": format!("0x{}", hex::encode(data)),
         });
         let est = quantity(&self.rpc("eth_estimateGas", json!([tx]))?)?;
-        Ok((est.saturating_mul(13) / 10).min(u64::MAX as u128) as u64)
+        Ok(with_headroom(est).min(u64::MAX as u128) as u64)
     }
 
     /// Sign and submit. Returns the transaction hash; the caller waits for it.
@@ -941,7 +1137,7 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
             Some(token) => Some(Holding { token, units: held(token).await? }),
             None => None,
         };
-        Ok(Purse { eoa: eoa.address, wei, erc20, wrapped })
+        Ok(Purse { eoa: eoa.address, wei, erc20, wrapped, fee_wei_per_gas: eoa.gas_price() })
     }
     .await;
     let purse = match purse {
@@ -952,6 +1148,7 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
         }
     };
     out.eth_wei = Some(purse.wei);
+    out.fee_wei_per_gas = purse.fee_wei_per_gas;
     let chosen = match plan(&purse, p.shield) {
         Ok(chosen) => chosen,
         Err(ask) => {
@@ -1038,8 +1235,23 @@ pub async fn run<B: RpcBackend>(backend: Arc<B>, p: Params) -> Run {
     out.legs.push(Leg::timed("approve", Some(t.elapsed().as_millis())));
 
     // ── the shield: the ENGINE's calldata, this probe's signature ──────────
+    //
+    // FIRST, THE LAST FREE QUESTION. Everything up to here is recoverable: the
+    // wrap left WETH the next run reuses and the approve left an allowance it
+    // reuses. A shield is not -- it puts a note in the contract's tree, and a
+    // note is worth the gas to move it, which is the gas this leg is about to
+    // spend. So the run re-prices against the fee as it is NOW rather than as
+    // it was at the `funding` leg, minutes and several blocks ago.
     entering("shield");
     let t = Instant::now();
+    let gate = shield_gate(&eoa);
+    out.fee_wei_per_gas = gate.fee_wei_per_gas.or(out.fee_wei_per_gas);
+    out.eth_wei = gate.wei.or(out.eth_wei);
+    if let Some(e) = gate.refusal {
+        out.needs_funding = Some(e.clone());
+        out.legs.push(Leg::failed("shield", Some(t.elapsed().as_millis()), e));
+        return out.finished(started);
+    }
     let shield = provider
         .shield()
         .shield(from.clone(), asset, shield_units)
@@ -1253,7 +1465,7 @@ pub fn summary(r: &Run) -> String {
     format!(
         "railgun_module: live-send probe: {} (chain={} node={:?}{}{} witnessBackend={:?} eoa={:?} \
          circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} syncedRootOnChain={:?} \
-         asset={:?} wrappedWei={:?} \
+         asset={:?} wrappedWei={:?} feeWeiPerGas={:?} \
          shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
          approve={:?}ms shield={:?}ms sync={:?}ms/{:?}blocks balance={:?}ms transfer={:?}ms \
          broadcast={:?}ms total={}ms)",
@@ -1273,6 +1485,7 @@ pub fn summary(r: &Run) -> String {
         r.synced_root_on_chain,
         r.asset,
         r.wrapped_wei,
+        r.fee_wei_per_gas,
         r.shield_tx,
         r.transfer_tx,
         r.calldata_bytes,
@@ -1606,6 +1819,9 @@ mod tests {
 
     // ── the funding decision, which is the whole of the operator ask ───────
 
+    /// A purse on a chain that would not quote a gas price, so these tests are
+    /// about the DECISION and not about the pricing -- which has its own tests
+    /// below, and its own arithmetic to be wrong in.
     fn purse(wei: u128, erc20: u128, wrapped: Option<u128>) -> Purse {
         Purse {
             eoa: probe_eoa_address(),
@@ -1613,6 +1829,7 @@ mod tests {
             erc20: Holding { token: SEPOLIA_USDC.parse().unwrap(), units: erc20 },
             wrapped: wrapped
                 .map(|units| Holding { token: ChainConfig::sepolia().wrapped_base_token, units }),
+            fee_wei_per_gas: None,
         }
     }
 
@@ -1674,6 +1891,160 @@ mod tests {
         let err = plan(&purse(0, DEFAULT_SHIELD * 100, Some(DEFAULT_WRAP_SHIELD)), None)
             .expect_err("it cannot pay for a transaction");
         assert!(err.contains(&MIN_GAS_WEI.to_string()), "{err}");
+    }
+
+    // ── WHAT THE ASK IS WORTH, which is not what a constant says ──────────
+
+    // THE ASK HAS TO SURVIVE ITS OWN RUN, and a constant cannot promise that.
+    //
+    // `MIN_GAS_WEI` was written against an estimate -- its own comment says "a
+    // shield is ~250 k gas" -- and the shield this probe has actually mined cost
+    // **731 335** (the receipts are in `docs/specs.md`, #213 cycle 6). Worse,
+    // the number a node checks a balance against is not what a transaction
+    // SPENDS but what EIP-1559 makes it RESERVE: `gas_limit * max_fee_per_gas`,
+    // and [`Eoa::send`] sets that ceiling at twice the chain's own `eth_gasPrice`
+    // over a limit 30 % above the estimate ([`Eoa::gas_limit`]).
+    //
+    // So the binding moment is the proved `transact(...)` -- the LAST leg,
+    // reached only after the shield has been mined. A purse that clears every
+    // earlier leg and fails there leaves a shielded note this EOA cannot spend:
+    // the operator's one funding transfer, spent on a balance nobody can move.
+    // A fork never showed this, because `anvil_setBalance` handed the probe
+    // 10 ETH.
+    #[test]
+    fn the_ask_survives_its_own_run_and_the_constant_it_replaces_does_not() {
+        // Sepolia's base fee while this was written, read off the chain
+        // (`eth_gasPrice` -> 0x3d24d3d7) rather than chosen.
+        let fee = 1_025_000_000_u128;
+        // What is left at the moment `can_still_transact` is asked -- i.e. just
+        // before the shield, with the wrap moved into WETH and the two
+        // recoverable legs paid for. The shield itself is what the gate is
+        // deciding about, so it is NOT deducted here.
+        let left = |start: u128| start - DEFAULT_WRAP_SHIELD - fee * (GAS_WRAP + GAS_APPROVE);
+
+        let asked = price_run(fee, DEFAULT_WRAP_SHIELD);
+        can_still_transact(left(asked), fee).expect("an ask that cannot finish its own run");
+        // And at a fee that has doubled under it, which is a routine hour on
+        // Sepolia -- the whole point of pricing rather than asserting.
+        can_still_transact(left(asked), fee * 2)
+            .expect("the ask carries no room for the fee to move");
+
+        // The constant does not. Stated as the arithmetic, not as an opinion:
+        // if this ever passes, the pricing above is dead weight and should go.
+        assert!(
+            can_still_transact(left(MIN_GAS_WEI), fee * 2).is_err(),
+            "MIN_GAS_WEI survives a doubled fee after all -- then do not price the run"
+        );
+    }
+
+    // AND THE QUESTION IS ASKED AGAIN WHERE STOPPING IS STILL FREE. A fee priced
+    // at the `funding` leg can have moved by the time the shield is signed: the
+    // legs between them are minutes apart on the public chain. The shield is the
+    // last moment at which nothing has been staked, so that is where the run
+    // re-prices. Refusing there costs the gas of the two legs before it;
+    // refusing at the `transact` costs a shielded balance as well.
+    #[test]
+    fn a_fee_that_moved_stops_the_run_before_the_shield_not_after() {
+        let fee = 1_025_000_000_u128;
+        let funded = price_run(fee, DEFAULT_WRAP_SHIELD);
+        let left = funded - DEFAULT_WRAP_SHIELD - fee * (GAS_WRAP + GAS_APPROVE);
+        let refused =
+            can_still_transact(left, fee * 10).expect_err("a tenfold fee is affordable?");
+        assert!(
+            refused.contains("BEFORE the shield"),
+            "the refusal has to name what it is protecting: {refused}"
+        );
+        assert!(
+            refused.contains(&probe_eoa_address().to_string()),
+            "and the address to top up: {refused}"
+        );
+    }
+
+    // THE RUN PRICES ITS OWN ASK OFF THE CHAIN IT IS POINTED AT. An operator
+    // reading this issue funds ONE number; it has to be the number this run
+    // needs on the chain as it is now, and it has to say what fee that was, so a
+    // stale ask is visible as a stale ask rather than as a mysterious failure.
+    #[test]
+    fn the_ask_is_priced_at_the_fee_the_chain_quoted() {
+        let fee = 3_000_000_000_u128;
+        let chain = Canned::with(&[
+            ("eth_getBalance", json!("0x0")),
+            ("eth_call", word(0)),
+            ("eth_gasPrice", json!(format!("0x{fee:x}"))),
+        ]);
+        let out = block_on(run(chain.clone(), Params::default()));
+        assert_eq!(out.fee_wei_per_gas, Some(fee), "the funding leg must read the fee");
+        let ask = out.needs_funding.clone().expect("an unfunded run must say what it needs");
+        // Spelled out here rather than read back from `price_run`, so this
+        // asserts the ask IS that number instead of asserting that two calls to
+        // the same function agree: the wrap, the three legs before the transact
+        // at a fee allowed to double, and the transact's own reservation at
+        // twice that over a limit 30 % above its measured gas.
+        let expected = DEFAULT_WRAP_SHIELD
+            + 2 * fee * (GAS_WRAP + GAS_APPROVE + GAS_SHIELD)
+            + 2 * fee * 2 * (GAS_TRANSACT * 13 / 10);
+        assert_eq!(price_run(fee, DEFAULT_WRAP_SHIELD), expected);
+        assert!(
+            ask.contains(&expected.to_string()),
+            "the ask must be this run's own price at that fee ({expected}): {ask}"
+        );
+        assert!(
+            expected > MIN_GAS_WEI + DEFAULT_WRAP_SHIELD,
+            "at {fee} wei/gas the priced ask is no bigger than the constant it replaced"
+        );
+        assert!(ask.contains(&fee.to_string()), "and it must name the fee it used: {ask}");
+        // Still nothing signed.
+        assert!(!chain.asked().iter().any(|m| m == "eth_sendRawTransaction"));
+    }
+
+    // A NODE THAT WILL NOT QUOTE A FEE DOES NOT STOP THE RUN. The price is
+    // evidence, like `web3_clientVersion` -- an unreadable one falls back to the
+    // constant, which is what every earlier cycle asked for, rather than
+    // refusing to say anything at all.
+    #[test]
+    fn a_node_that_will_not_price_gas_falls_back_to_the_constant() {
+        let chain = Canned::with(&[("eth_getBalance", json!("0x0")), ("eth_call", word(0))]);
+        let out = block_on(run(chain, Params::default()));
+        assert_eq!(out.fee_wei_per_gas, None);
+        let ask = out.needs_funding.expect("an ask");
+        assert!(ask.contains(&(MIN_GAS_WEI + DEFAULT_WRAP_SHIELD).to_string()), "{ask}");
+    }
+
+    // AND THE GATE AS IT IS ACTUALLY WIRED, over a chain. `can_still_transact`
+    // is the arithmetic; this is the leg -- it has to READ the fee and the
+    // balance off the chain at that moment, and it has to refuse without
+    // sending anything.
+    #[test]
+    fn the_shield_gate_reads_the_chain_and_refuses_without_spending() {
+        // Ten gwei: Sepolia does this, and a purse funded at one gwei does not
+        // survive it.
+        let fee = 10_000_000_000_u128;
+        let chain = Canned::with(&[
+            ("eth_gasPrice", json!(format!("0x{fee:x}"))),
+            ("eth_getBalance", json!(format!("0x{MIN_GAS_WEI:x}"))),
+        ]);
+        let gate = shield_gate(&Eoa::new(chain.clone(), SEPOLIA));
+        assert_eq!(gate.fee_wei_per_gas, Some(fee), "the gate must read the fee, not assume it");
+        assert_eq!(gate.wei, Some(MIN_GAS_WEI));
+        let refusal = gate.refusal.expect("ten gwei over this balance is not affordable");
+        assert!(refusal.contains("BEFORE the shield"), "{refusal}");
+        assert!(
+            !chain.asked().iter().any(|m| m == "eth_sendRawTransaction"),
+            "it refused AFTER signing something: {:?}",
+            chain.asked()
+        );
+    }
+
+    // A NODE THAT WILL NOT PRICE THE SHIELD DOES NOT BLOCK IT. The gate is a
+    // safeguard, not a dependency: a chain that answers nothing must leave the
+    // run exactly as it was before this was added, or a #213 run that used to
+    // complete now stops for a reason that is not about money.
+    #[test]
+    fn a_node_that_will_not_price_the_shield_does_not_block_it() {
+        let chain = Canned::with(&[("eth_getBalance", json!("0x0"))]);
+        let gate = shield_gate(&Eoa::new(chain, SEPOLIA));
+        assert_eq!(gate.wei, Some(0));
+        assert!(gate.refusal.is_none(), "an unreadable fee must never be a refusal");
     }
 
     // THE WRAP ITSELF. Destination, value and selector are the whole leg and all

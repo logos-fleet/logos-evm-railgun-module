@@ -747,7 +747,9 @@ transaction this EOA can sign, and RAILGUN shields WETH like any other ERC-20
 
 So `plan` (pure, and unit-tested without a chain) decides in this order:
 
-1. no gas → ask, whatever else is held: nothing can be signed without it;
+1. not enough ETH for the whole run → ask, whatever else is held: the last
+   leg's reservation is due whatever is shielded, so this is `price_run` with
+   nothing wrapped and not merely "no gas";
 2. enough of the preferred ERC-20 (`asset`, default Sepolia USDC) → shield that,
    wrap nothing — so a USDC balance an operator did send is never stranded;
 3. a **named** `asset` that is short → ask, naming it: `deposit()` exists on the
@@ -755,8 +757,12 @@ So `plan` (pure, and unit-tested without a chain) decides in this order:
 4. enough of the wrapped base token already → shield that, wrap nothing;
 5. ETH covering gas **and** the shortfall → wrap exactly the shortfall (a second
    run tops its change up rather than re-minting, so ETH does not leak);
-6. otherwise → ask, in ETH: `MIN_GAS_WEI + DEFAULT_WRAP_SHIELD`
-   = `5100000000000000` wei ≈ **0.0051 ETH** (0.01 is comfortable).
+6. otherwise → ask, in ETH — and the number is `price_run(fee, shortfall)` at the
+   fee the chain has just quoted, not a constant. At Sepolia's ~1 gwei that is
+   ≈ **0.0070 ETH**; at 2 gwei ≈ 0.0140. `MIN_GAS_WEI + DEFAULT_WRAP_SHIELD`
+   (0.0051 ETH) is only the floor, used where a node will not quote a price —
+   see *THE OPERATOR ASK IS A PRICE, NOT A CONSTANT* below for why that constant
+   was not enough and what it cost.
 
 #### Until it is funded, a run SURVEYS the chain and then hands off
 
@@ -785,6 +791,82 @@ already held, `100000000000000` wei (0.0001 ETH, 18 decimals) for the wrapped
 base token it mints. `transfer` defaults to **half of whatever the engine reports
 as shielded**, which keeps a change note (and so the `01x02` circuit the other
 two probes measured) whatever the RAILGUN shield fee took.
+
+#### THE OPERATOR ASK IS A PRICE, NOT A CONSTANT — and a constant stranded a shield
+
+`MIN_GAS_WEI` used to *be* the ask: 0.005 ETH, written against an estimate its
+own comment stated as "a shield is ~250 k gas". The shield this probe has
+actually mined costs **731 335** (block 11 720 023, #213 cycle 6), and the number
+that decides a run is not what a transaction **spends** but what EIP-1559 makes
+it **reserve** — a node refuses `eth_sendRawTransaction` unless the account
+covers `gas_limit * max_fee_per_gas + value` at submission. `Eoa::send` sets that
+ceiling at twice the chain's own `eth_gasPrice`, over a limit 30 % above the
+estimate (`Eoa::gas_limit`).
+
+So the binding moment is the **proved `transact(...)`**: the largest reservation
+of the four, and the only one reached *after the shield has been mined*. A purse
+that clears every earlier leg and fails there leaves a note in the contract's
+tree worth exactly the gas to move it — which is the gas the account no longer
+has. A fork never showed this, because `anvil_setBalance` handed the probe
+10 ETH.
+
+**Reproduced, on a fork, with the old ask funded exactly** (0.0051 ETH, the
+constant plus the wrap):
+
+```
+wrap ok -> approve ok -> shield MINED 0x9385c185…  (rootOnChain true, verified proof)
+broadcast -> {"code":-32003,"message":"Insufficient funds for gas * price + value"}
+```
+
+The whole send had cost **0.00336 ETH** of gas by then — *less* than the 0.0051
+funded. The account was not out of money; it was out of *reservation*. That is
+why the constant looked sufficient and was not.
+
+`price_run(fee, wrap)` replaces it: the wrap, plus the three legs before the
+transact, plus the transact's own reservation, all at a fee allowed to drift
+(`FEE_DRIFT_MULTIPLE`, because four transactions and a sync are minutes apart and
+Sepolia's base fee moves inside that window). The gas figures are measured, not
+estimated, and each is a receipt in this document. Against the same 0.0051 ETH
+the run now stops at `funding` with **nothing signed**, and names the number:
+
+```
+NEEDS FUNDING -- fund 0x23cc…1722 on Sepolia with at least 13973417536043890 wei
+of ETH (priced at the chain's own 2013988113 wei/gas for 1831027 gas of shield
+and transact, with room for the fee to move): it holds 5100000000000000 wei …
+```
+
+**Funded at exactly that price, the whole send completes** — fork at block
+11 722 225, `rootOnChain: true`, shield and proved `transact(...)` both mined,
+total 40 319 ms. It spent 0.00336 ETH and left 77 % of the ask untouched: that
+remainder *is* the transact's reservation, and it has to be there.
+
+#### And the question is asked again where refusing is still free
+
+A fee priced at the `funding` leg can have moved by the time the shield is
+signed. The shield is the last leg at which nothing has been staked — the wrap
+left WETH the next run reuses, the approve left an allowance it reuses — so
+`shield_gate` re-reads the fee and the balance immediately before it and answers
+`can_still_transact`. Refusing there costs two legs of gas; refusing one leg
+later costs a shielded balance as well, and a shield has to be re-mined and
+re-synced.
+
+Demonstrated on a fresh fork, funded at the priced ask and made unaffordable at
+that exact moment (`anvil_setBalance` between the approve and the shield; on the
+public chain the same condition is reached by the base fee rising):
+
+```
+funding=674ms wrap=3035ms engine=4ms approve=2321ms shield=3ms  shieldTx=None
+NEEDS FUNDING -- stopping BEFORE the shield: it would leave 3417816271180900 wei
+and the proved transact(...) reserves 4849404230108176 at the chain's current
+1849850098 wei/gas. Shielding now would put a note in the contract's tree that
+this EOA could not then spend. Top 0x23cc…1722 up and run again -- nothing has
+been shielded, so nothing is stranded.
+```
+
+A node that will not quote a gas price is **not** a refusal, at either place: the
+price is evidence, like `web3_clientVersion`, and an unreadable one falls back to
+`MIN_GAS_WEI` rather than stopping a run. `feeWeiPerGas` is reported in the
+summary line and in the probe's JSON so a stale ask can be told from a wrong one.
 
 #### `syncedRootOnChain`: the verdict the engine asks for and throws away
 
@@ -1222,10 +1304,12 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   mined by the RAILGUN contract — runs end to end on the physical iPad Air 4,
   but against `anvil --fork-url <sepolia>`, and every such run says so with
   `FORK-NOT-PUBLIC-SEPOLIA`. What the public chain adds is that the ETH and the
-  blocks were not local, and it is **one operator transfer**: ≥ 0.0051 Sepolia
-  ETH to `0x23cc2752F664Bf465A3631253687712b222B1722` (the probe mints its own
-  ERC-20 out of it). No agent at this venue can obtain testnet funds, and the
-  venue's own funded account cannot sign for one — keystore signing is a human
+  blocks were not local, and it is **one operator transfer**: Sepolia ETH to
+  `0x23cc2752F664Bf465A3631253687712b222B1722` (the probe mints its own ERC-20
+  out of it), in the amount the run's own `needsFunding` prints — ≈ 0.0070 ETH at
+  a 1 gwei base fee, and 0.02 is comfortable at any fee this chain has shown. No
+  agent at this venue can obtain testnet funds, and the venue's own funded
+  account cannot sign for one — keystore signing is a human
   `approve(handle, bundle_id, password)` and the vault password is not an
   agent's to have. Until then an unfunded run **surveys** the public chain
   instead of stopping: engine, a sync of the real accumulator to the live tip,

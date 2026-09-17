@@ -244,11 +244,12 @@ pub trait RailgunModule: 'static {
     /// AND THE SAME SEND WITH NOTHING SUBSTITUTED — ON CHAIN, MINED, AND
     /// ACCEPTED BY THE CONTRACT.
     /// `{ "asset"?, "shield"?, "transfer"?, "memo"?, "broadcast"?, "confirmMs"? }`
-    /// → `{ ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits,
-    /// needsFunding?, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx,
-    /// shieldBlock, syncFromBlock, syncToBlock, balance, transferred, circuit,
-    /// rootOnChain, syncedTree, syncedRoot, syncedRootOnChain, calldataBytes,
-    /// transferTx, transferBlock, totalMs, legs: [{ name, ms, ok, error? }] }`.
+    /// → `{ ok, chainId, node, forked, witnessBackend, eoa, ethWei, feeWeiPerGas,
+    /// tokenUnits, needsFunding?, asset, wrappedWei, wrapTx, from, to, approveTx,
+    /// shieldTx, shieldBlock, syncFromBlock, syncToBlock, balance, transferred,
+    /// circuit, rootOnChain, syncedTree, syncedRoot, syncedRootOnChain,
+    /// calldataBytes, transferTx, transferBlock, totalMs,
+    /// legs: [{ name, ms, ok, error? }] }`.
     ///
     /// `node` / `forked` say WHOSE chain answered, because a fork of Sepolia
     /// prints byte-identical lines to the public chain. `witnessBackend` is the
@@ -274,6 +275,14 @@ pub trait RailgunModule: 'static {
     /// ETH and nothing else**: with no ERC-20 in hand the probe mints its own by
     /// wrapping some of its ETH into the chain's wrapped base token (`wrap`
     /// leg), which RAILGUN shields like any other ERC-20.
+    ///
+    /// HOW MUCH is priced off the chain rather than fixed: `needsFunding` names
+    /// the run's own measured gas at the `feeWeiPerGas` the node quoted, with
+    /// room for the base fee to move. The binding cost is not what the four
+    /// transactions spend but what EIP-1559 makes the LAST of them reserve, and
+    /// that one is reached only after the shield has been mined — so the run
+    /// re-prices immediately before the shield, which is the last leg at which
+    /// refusing costs nothing. See [`crate::live_send::price_run`].
     ///
     /// An unfunded run then SURVEYS rather than stopping: it still builds the
     /// engine, walks the real accumulator to the live tip and checks the root it
@@ -1045,6 +1054,9 @@ impl RailgunModule for RailgunModuleImpl {
             "eoa": run.eoa,
             // Decimal strings for the same reason the params are.
             "ethWei": run.eth_wei.map(|v| v.to_string()),
+            // What the funding leg priced this run at, so a reader can tell a
+            // stale ask from a wrong one -- see `live_send::price_run`.
+            "feeWeiPerGas": run.fee_wei_per_gas.map(|v| v.to_string()),
             "tokenUnits": run.token_units.map(|v| v.to_string()),
             "needsFunding": run.needs_funding,
             "asset": run.asset,
