@@ -954,12 +954,11 @@ pub fn report(r: &Run) {
 pub fn summary(r: &Run) -> String {
     let leg = |n: &str| r.leg(n).and_then(|l| l.ms);
     format!(
-        "railgun_module: live-send probe: {} (chain={} node={:?}{} witnessBackend={:?} \
-         eoa={:?} circuit={:?} \
-         shielded={:?} transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} \
+        "railgun_module: live-send probe: {} (chain={} node={:?}{} witnessBackend={:?} eoa={:?} \
+         circuit={:?} shielded={:?} transferred={:?} rootOnChain={:?} asset={:?} wrappedWei={:?} \
          shieldTx={:?} transferTx={:?} calldata={:?}B funding={:?}ms wrap={:?}ms engine={:?}ms \
-         approve={:?}ms shield={:?}ms sync={:?}ms balance={:?}ms transfer={:?}ms \
-         broadcast={:?}ms total={}ms)",
+         approve={:?}ms shield={:?}ms sync={:?}ms balance={:?}ms transfer={:?}ms broadcast={:?}ms \
+         total={}ms)",
         if r.ok() { "SENT" } else { "DID NOT" },
         r.chain_id,
         r.node,
@@ -1130,11 +1129,30 @@ mod tests {
     // chain, so the report has to name its node rather than leave the
     // distinction in a human's memory: `anvil/v1.8.1` is a fork, `erigon/…` or
     // `Nethermind/…` is not.
-    /// #213 clause 2 asks for the backend the engine's OWN `calculate_witness`
-    /// chose, and on a device that evidence is a line the VENDORED engine
-    /// prints — a different line, from a different crate, which a machine-read
-    /// result never sees. So the run's own summary names it too, and one line
-    /// then carries the backend beside `rootOnChain` and the timings.
+    #[test]
+    fn the_run_names_the_node_that_answered() {
+        let chain = Canned::with(&[
+            ("web3_clientVersion", json!("anvil/v1.8.1")),
+            ("eth_getBalance", json!("0x0")),
+            ("eth_call", word(0)),
+        ]);
+        let out = block_on(run(chain, Params::default()));
+        assert_eq!(
+            out.node.as_deref(),
+            Some("anvil/v1.8.1"),
+            "a run that stops at funding must still say whose chain it read"
+        );
+        assert!(
+            out.forked,
+            "an anvil client version is a local fork and the run must say so"
+        );
+    }
+
+    // AND WHICH BACKEND PROVED. #213 clause 2 asks for the backend the engine's
+    // OWN `calculate_witness` chose, and on a device that evidence is a line the
+    // VENDORED engine prints — a different line, from a different crate, which a
+    // machine-read result never sees. So the run's own summary names it too, and
+    // one line then carries the backend beside `rootOnChain` and the timings.
     #[test]
     fn the_run_names_the_backend_the_engine_proves_with() {
         let chain = Canned::with(&[
@@ -1155,8 +1173,8 @@ mod tests {
         );
     }
 
-    /// And the name is read off the platform rather than typed: the interpreter
-    /// is the answer on a physical iOS device and nowhere else (#188).
+    // And the name is read off the platform rather than typed: the interpreter
+    // is the answer on a physical iOS device and nowhere else (#188).
     #[test]
     fn only_a_physical_ios_device_proves_on_the_interpreter() {
         let want = if cfg!(all(target_os = "ios", not(target_abi = "sim"))) {
@@ -1165,25 +1183,6 @@ mod tests {
             "engine-default"
         };
         assert_eq!(Run::default().witness_backend(), want);
-    }
-
-    #[test]
-    fn the_run_names_the_node_that_answered() {
-        let chain = Canned::with(&[
-            ("web3_clientVersion", json!("anvil/v1.8.1")),
-            ("eth_getBalance", json!("0x0")),
-            ("eth_call", word(0)),
-        ]);
-        let out = block_on(run(chain, Params::default()));
-        assert_eq!(
-            out.node.as_deref(),
-            Some("anvil/v1.8.1"),
-            "a run that stops at funding must still say whose chain it read"
-        );
-        assert!(
-            out.forked,
-            "an anvil client version is a local fork and the run must say so"
-        );
     }
 
     // A node that does not answer `web3_clientVersion` is NOT a failed run: the

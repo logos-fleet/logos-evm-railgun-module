@@ -804,17 +804,16 @@ engine's own witness, `Groth16Prover::prove`, verify and the artifact fetch —
 is **3636 ms** (3912 ms on the second run) on the A14 under `wasmi`, against
 **3719 ms** on an M2 simulator under cranelift and #222's `total=4509ms` for the
 same three legs over placeholder values. The 239 s a private send takes on this
-handset is **221 s of accumulator sync**; the proving half is under 2 % of it. So a progress UI and a
-cancel path are needed for the SYNC, and #188's JIT-off patch costs the user
-nothing measurable.
+handset is **221 s of accumulator sync**; the proving half is under 2 % of it.
+So a progress UI and a cancel path are needed for the SYNC, and #188's JIT-off
+patch costs the user nothing measurable.
 
 **And `witnessBackend` is in the result, not only in the console.** The
 `railgun: witness store backend = …` line belongs to the vendored engine and
 never reaches a caller reading JSON, so `Run::witness_backend()` reports the same
 cfg (`proof_circuit::ENGINE_BACKEND`) in the summary line and in
-`live_send_probe`'s object — one line then carries the backend, `rootOnChain` and
-the timings together.
-
+`live_send_probe`'s object — one line then carries the backend, `rootOnChain`
+and the timings together.
 
 The same two Bundled-set requirements as `private_send_probe` apply —
 `capability_module` in the set, and one `eth_rpc_module.init_defaults()` on a

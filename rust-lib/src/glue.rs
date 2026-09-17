@@ -190,10 +190,9 @@ pub trait RailgunModule: 'static {
     /// ACCEPTED BY THE CONTRACT.
     /// `{ "asset"?, "shield"?, "transfer"?, "memo"?, "broadcast"?, "confirmMs"? }`
     /// → `{ ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits,
-    /// needsFunding?, asset, wrappedWei, wrapTx, from, to,
-    /// approveTx, shieldTx, shieldBlock, balance, transferred, circuit,
-    /// rootOnChain, calldataBytes, transferTx, transferBlock, totalMs,
-    /// legs: [{ name, ms, ok, error? }] }`.
+    /// needsFunding?, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx,
+    /// shieldBlock, balance, transferred, circuit, rootOnChain, calldataBytes,
+    /// transferTx, transferBlock, totalMs, legs: [{ name, ms, ok, error? }] }`.
     ///
     /// `node` / `forked` say WHOSE chain answered, because a fork of Sepolia
     /// prints byte-identical lines to the public chain. `witnessBackend` is the
@@ -841,9 +840,8 @@ impl RailgunModule for RailgunModuleImpl {
             // a desk is indistinguishable from a run on the public chain.
             "node": run.node,
             "forked": run.forked,
-            // The backend the ENGINE's own `calculate_witness` used (#213
-            // clause 2). The vendored engine prints it on stderr; a caller that
-            // reads this JSON never sees that line, so the run carries it.
+            // The backend the ENGINE proved on, which it announces only on
+            // stderr — see `live_send::Run::witness_backend`.
             "witnessBackend": run.witness_backend(),
             "eoa": run.eoa,
             // Decimal strings for the same reason the params are.
