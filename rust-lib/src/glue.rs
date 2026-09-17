@@ -1072,6 +1072,10 @@ impl RailgunModule for RailgunModuleImpl {
             "syncFromBlock": run.sync_from_block,
             "syncToBlock": run.sync_to_block,
             "balance": run.balance.map(|v| v.to_string()),
+            // THIS RUN SHIELDED NOTHING because the tree already held its note
+            // -- see `live_send::Run::reused_note`. `shieldTx` is then null for
+            // a reason a reader must not have to guess at.
+            "reusedNote": run.reused_note,
             "transferred": run.transferred.map(|v| v.to_string()),
             "circuit": run.circuit,
             "rootOnChain": run.root_on_chain,

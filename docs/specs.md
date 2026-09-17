@@ -676,7 +676,7 @@ LOGOS_IOS_TEAM_ID=… LOGOS_IOS_DEVICE=<udid> \
   `no configuration for chain 11155111`. `init_defaults()` is idempotent and
   persists, so it is needed on the first launch only.
 
-### `live_send_probe(params_json) → { ok, chainId, node, forked, witnessBackend, eoa, ethWei, tokenUnits, needsFunding, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx, shieldBlock, syncFromBlock, syncToBlock, balance, transferred, circuit, rootOnChain, syncedTree, syncedRoot, syncedRootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
+### `live_send_probe(params_json) → { ok, chainId, node, forked, witnessBackend, eoa, ethWei, feeWeiPerGas, tokenUnits, needsFunding, asset, wrappedWei, wrapTx, from, to, approveTx, shieldTx, shieldBlock, syncFromBlock, syncToBlock, balance, reusedNote, transferred, circuit, rootOnChain, syncedTree, syncedRoot, syncedRootOnChain, calldataBytes, transferTx, transferBlock, totalMs, legs, error }`
 **The same send with NOTHING substituted: on chain, mined, and accepted by the
 contract** (#213 acceptance clause 1).
 
@@ -687,20 +687,33 @@ syncs the **real** Sepolia tree, proves over the root the **contract** holds,
 and broadcasts the proved `transact(...)` so the RAILGUN smart wallet itself
 verifies the Groth16 proof the device produced.
 
+**THE FREE HALF COMES FIRST, AND IT DECIDES THE ASK.** `engine`, `sync`,
+`synced-root` and `balance` cost nothing and need no signature, so every run
+makes them before it prices itself — because whether the tree ALREADY holds one
+of this probe's notes changes both what is left to do and what it costs (see
+"a mined shield survives the run that made it" below). That ordering is only
+affordable since #235 cut the cold sync from 221 s to seconds on a handset.
+
 | leg | what happens |
 |---|---|
 | `keys` | the probe's own railgun signer + counterparty, from the same fixed seeds `private_send_probe` uses |
-| `funding` | `eth_getBalance` + `balanceOf` for the preferred ERC-20 and for the chain's wrapped base token, then [`plan`] decides what to shield — the gate, see below |
-| `wrap` | `deposit()` on the wrapped base token, signed, broadcast, waited on — the probe MINTING the ERC-20 it shields out of its own ETH. Skipped whenever an ERC-20 is already held |
 | `engine` | `RailgunBuilder::build` over a `MemoryDatabase` and the **default** syncer (subsquid, then RPC): the real chain's events, not a syncer we wrote |
-| `approve` | ERC-20 `approve(RailgunSmartWallet, amount)` — signed, broadcast, waited on. Skipped where the allowance already covers it |
-| `shield` | the ENGINE's own `ShieldBuilder` calldata — signed, broadcast, waited on |
-| `sync` | the engine finds its own note in the contract's tree, beside every other shield ever made on this chain. Stepped and reported (#235) |
+| `sync` | the whole accumulator, every shield ever made on this chain. Stepped and reported (#235) |
 | `synced-root` | `syncedRootOnChain`: the root the engine synced TO, checked against the contract — the verdict the engine asks for and throws away, see below |
-| `balance` | a shielded balance a **transaction** put there |
+| `balance` | what the tree holds for this probe, per candidate token — the input to the funding decision |
+| `funding` | `eth_getBalance` + `balanceOf` for the preferred ERC-20 and for the chain's wrapped base token, then [`plan`] decides whether to SPEND a note already in the tree or to shield a new one — the gate, see below |
+| `wrap` | `deposit()` on the wrapped base token, signed, broadcast, waited on — the probe MINTING the ERC-20 it shields out of its own ETH. Skipped whenever an ERC-20 is already held, and whenever a note is being reused |
+| `approve` | ERC-20 `approve(RailgunSmartWallet, amount)` — signed, broadcast, waited on. Skipped where the allowance already covers it, and on a reuse |
+| `shield` | the ENGINE's own `ShieldBuilder` calldata — signed, broadcast, waited on. Skipped on a reuse |
+| `resync` | the blocks since the `sync` leg, the shield's own among them — the same engine and database, so it resumes rather than starting again. Skipped on a reuse |
+| `note` | the shield became a spendable note: a shielded balance a **transaction** put there. Skipped on a reuse, where the `balance` leg already found one |
 | `transfer` | `TransactionBuilder` → circuit inputs → the engine's own `calculate_witness` → `Groth16Prover::prove` **and verify** |
 | `root-on-chain` | `RailgunSmartWallet.rootHistory(tree, root)` — expected **true**, and a `false` here FAILS the leg rather than being reported as a limit |
 | `broadcast` | the proved `transact(...)` sent and mined: the chain's own verdict on the proof |
+
+A run whose `engine` or `sync` leg fails still prints its funding ask — the ask
+is the handoff and must survive a broken survey — and then stops, because a tree
+that is not the chain's is not something to prove against.
 
 The tree number is read off the operation the engine built
 (`transaction.boundParams.treeNumber`), not assumed: RAILGUN opens a new tree
@@ -867,6 +880,54 @@ A node that will not quote a gas price is **not** a refusal, at either place: th
 price is evidence, like `web3_clientVersion`, and an unreadable one falls back to
 `MIN_GAS_WEI` rather than stopping a run. `feeWeiPerGas` is reported in the
 summary line and in the probe's JSON so a stale ask can be told from a wrong one.
+
+#### A MINED SHIELD SURVIVES THE RUN THAT MADE IT, so the next run SPENDS it
+
+`shield_gate` above stops a run from **stranding** a note. This is the other
+half: a note that is already there.
+
+A shield that has been mined is the expensive half of clause 1 — 731 335 gas and
+a wait for a block — and it is a leaf in the contract's accumulator, not
+something the run owns. Several ordinary failures leave one behind *after* the
+money is spent: a `transfer` leg that cannot reach the artifact host, a phone
+that backgrounds the app mid-sync, a `broadcast` refused for funds (which is
+exactly the failure reproduced on a fork at the old ask). Before this, the next
+run wrapped, allowed and shielded a **second** note — another whole funding ask
+— and abandoned the first one for good.
+
+So the tree is asked **before** the purse, and `plan` answers `Plan::Spend`
+rather than `Plan::Shield` when it already holds a note worth splitting
+(`MIN_TRANSFERABLE`: the transfer is half of the note, so one unit splits into
+nothing to prove over). Two things follow:
+
+* the run goes straight from the sync to the proof — `wrapTx`, `approveTx` and
+  `shieldTx` are all `null`, `reusedNote` is `true`, and the summary line says
+  `REUSED-A-MINED-SHIELD` so that a missing `shield` leg reads as *already paid
+  for* rather than as *skipped*;
+* the **ask shrinks to `price_spend`** — what the proved `transact(...)` alone
+  reserves, since the three legs before it have been paid for once already. An
+  operator topping up after a failure is not asked a second time for them.
+
+Two runs on one fresh fork, the second handed **only** `price_spend` at the fee
+the node quoted (`a_run_after_a_mined_shield_spends_the_note_instead_of_shielding_again`):
+
+```
+SENT … shieldTx=Some("0x0fd30da8…c710") wrappedWei=Some(100000000000000)
+       shielded=Some(99750000000000)  transferred=Some(49875000000000)
+       rootOnChain=Some(true) feeWeiPerGas=Some(1939455664)
+       funding=489ms wrap=3049ms approve=2287ms shield=4700ms sync=9817ms
+       resync=582ms transfer=15229ms broadcast=4734ms total=40931ms
+
+SENT … REUSED-A-MINED-SHIELD  shieldTx=None wrappedWei=None
+       shielded=Some(49875000000000)  transferred=Some(24937500000000)
+       rootOnChain=Some(true) feeWeiPerGas=Some(1725222835)
+       funding=3ms wrap=Nonems approve=Nonems shield=Nonems sync=9287ms
+       resync=Nonems transfer=15997ms broadcast=2685ms total=27988ms
+```
+
+The second run sends the **change note** the first one left, its proof is built
+over a root the contract confirms, and the RAILGUN contract mines it — out of a
+purse that could not have started a fresh run.
 
 #### `syncedRootOnChain`: the verdict the engine asks for and throws away
 
@@ -1313,7 +1374,10 @@ against a `keystore_module` pin whose LIDL predates `caller_identity`.
   `approve(handle, bundle_id, password)` and the vault password is not an
   agent's to have. Until then an unfunded run **surveys** the public chain
   instead of stopping: engine, a sync of the real accumulator to the live tip,
-  and `syncedRootOnChain` true — measured on the handset, 3.9 s.
+  and `syncedRootOnChain` true — measured on the handset, 3.9 s. And a run that
+  mines its shield and then fails no longer costs a second one: the next run
+  spends the note already in the tree, for the price of the `transact(...)`
+  alone (`reusedNote`, above).
 - **Canonical recovery**: `init_from_seed` is not yet RAILGUN-Community BIP-32.
 - **UserOp status**: `relayed_send_status` returns the `userOpHash` once the
   operation is submitted; polling its receipt (`eth_getUserOperationReceipt`) is
